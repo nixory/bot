@@ -342,39 +342,6 @@ async def support_start(cb: CallbackQuery):
     )
     await cb.answer("Жду твоё сообщение 👇")
 
-@rt.message(F.chat.type == "private")
-async def support_collector(msg: Message):
-    """Приём единственного сообщения для поддержки (до handle_text)."""
-    uid = msg.from_user.id
-    if uid not in PENDING_SUPPORT:
-        return
-
-    PENDING_SUPPORT.pop(uid, None)
-
-    if not ADMIN_CHAT_ID:
-        await msg.reply("Поддержка временно недоступна 😕")
-        return
-
-    header = (
-        "🆘 <b>Запрос в поддержку</b>\n"
-        f"От: @{msg.from_user.username or '—'} (ID: <code>{uid}</code>)\n"
-        f"Имя: {html.escape(msg.from_user.full_name)}\n"
-    )
-    with suppress(Exception):
-        await bot.send_message(ADMIN_CHAT_ID, header, disable_web_page_preview=True)
-
-    ok = True
-    try:
-        await bot.forward_message(chat_id=ADMIN_CHAT_ID, from_chat_id=msg.chat.id, message_id=msg.message_id)
-    except Exception as e:
-        ok = False
-        logging.warning("forward failed: %s", e)
-
-    if not ok and msg.text:
-        with suppress(Exception):
-            await bot.send_message(ADMIN_CHAT_ID, "Текст обращения:\n\n" + html.escape(msg.text))
-
-    await msg.reply("Готово! Мы получили твоё обращение — служба поддержки свяжется с тобой. 🙌")
 
 # ─── ADMIN REPLY ─────────────────────────────────────────────────────────────
 @rt.message(Command("reply"))
@@ -398,38 +365,84 @@ async def admin_reply(msg: Message):
         await msg.reply("❌ Не смог отправить (возможно, юзер не писал боту).")
 
 # ─── HANDLE TEXT (suggest flow) ──────────────────────────────────────────────
-@rt.message(F.text & (F.chat.type == "private"))
-async def handle_text(msg: Message):
+# ─── PRIVATE INBOX: support + suggest ────────────────────────────────────────
+def _is_time_str(s: str) -> bool:
+    if not s:
+        return False
+    s = s.strip()
+    # 15.08 20:30 | 15-08 20:30 | 2025-08-15 20:30 | допускаем пробел/Т/знаки
+    p1 = r"\b\d{1,2}[.\-/]\d{1,2}(?:[.\-/]\d{2,4})?\s+[Tt]?\s*\d{1,2}:\d{2}\b"
+    p2 = r"\b\d{4}[.\-/]\d{2}[.\-/]\d{2}\s+[Tt]?\s*\d{1,2}:\d{2}\b"
+    return bool(re.search(p1, s) or re.search(p2, s))
+
+@rt.message(F.chat.type == "private")
+async def inbox_private(msg: Message):
     uid = msg.from_user.id
-    if uid not in PENDING_SUGGEST:
-        return
-    gid = PENDING_SUGGEST.pop(uid)
 
-    when = msg.text.strip()
-    ok = bool(re.search(r"\d{1,2}[.\-/]\d{1,2}.*\d{1,2}:\d{2}", when) or
-              re.search(r"\d{4}-\d{2}-\d{2}.*\d{1,2}:\d{2}", when))
-    if not ok:
-        await msg.reply("Формат не похож на дату/время 😅 Пример: <code>15.08 20:30</code>.")
-        PENDING_SUGGEST[uid] = gid
-        return
-
-    mf = await get_manifest()
-    girl = next((x for x in girls_list(mf) if int(x.get("id")) == gid), None)
-    gname = (girl or {}).get("name", f"#{gid}")
-    gurl = (girl or {}).get("url", SHOP_URL)
-
-    text = (
-        "📝 <b>Заявка времени</b>\n"
-        f"От: <a href=\"tg://user?id={uid}\">{html.escape(msg.from_user.full_name)}</a>\n"
-        f"Девушка: <b>{html.escape(gname)}</b>\n"
-        f"Время: <code>{html.escape(when)}</code>\n"
-        f"Ссылка: {gurl}"
-    )
-    if ADMIN_CHAT_ID:
+    # 1) SUPPORT FLOW
+    if PENDING_SUPPORT.pop(uid, None):
+        if not ADMIN_CHAT_ID:
+            await msg.reply("Поддержка временно недоступна 😕")
+            return
+        header = (
+            "🆘 <b>Запрос в поддержку</b>\n"
+            f"От: @{msg.from_user.username or '—'} (ID: <code>{uid}</code>)\n"
+            f"Имя: {html.escape(msg.from_user.full_name)}\n"
+        )
         with suppress(Exception):
-            await bot.send_message(ADMIN_CHAT_ID, text, disable_web_page_preview=True)
+            await bot.send_message(ADMIN_CHAT_ID, header, disable_web_page_preview=True)
 
-    await msg.answer("Принято! Менеджер свяжется для подтверждения 👌")
+        forwarded = True
+        try:
+            await bot.forward_message(ADMIN_CHAT_ID, msg.chat.id, msg.message_id)
+        except Exception as e:
+            logging.warning("support forward failed: %s", e)
+            forwarded = False
+
+        if not forwarded and msg.text:
+            with suppress(Exception):
+                await bot.send_message(ADMIN_CHAT_ID, "Текст обращения:\n\n" + html.escape(msg.text))
+
+        await msg.reply("Готово! Мы получили твоё обращение — служба поддержки свяжется с тобой. 🙌")
+        return  # важный выход
+
+    # 2) SUGGEST-TIME FLOW
+    gid = PENDING_SUGGEST.get(uid)
+    if gid is not None:
+        # снимаем ожидание
+        PENDING_SUGGEST.pop(uid, None)
+
+        when = (msg.text or "").strip()
+        if not _is_time_str(when):
+            await msg.reply(
+                "Формат не похож на дату/время 😅 Пример: <code>15.08 20:30</code> или <code>2025-08-15 20:30</code>."
+            )
+            # ставим обратно ожидание
+            PENDING_SUGGEST[uid] = gid
+            return
+
+        mf = await get_manifest()
+        girl = next((x for x in girls_list(mf) if int(x.get("id")) == int(gid)), None)
+        gname = (girl or {}).get("name", f"#{gid}")
+        gurl = (girl or {}).get("url", SHOP_URL)
+
+        text = (
+            "📝 <b>Заявка времени</b>\n"
+            f"От: <a href=\"tg://user?id={uid}\">{html.escape(msg.from_user.full_name)}</a>\n"
+            f"Девушка: <b>{html.escape(gname)}</b>\n"
+            f"Время: <code>{html.escape(when)}</code>\n"
+            f"Ссылка: {gurl}"
+        )
+        if ADMIN_CHAT_ID:
+            with suppress(Exception):
+                await bot.send_message(ADMIN_CHAT_ID, text, disable_web_page_preview=True)
+
+        await msg.answer("Принято! Менеджер свяжется для подтверждения 👌")
+        return
+
+    # 3) если это не поддержка и не заявка — игнорим (пусть другие хэндлеры ловят команды)
+    return
+
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 async def main():
