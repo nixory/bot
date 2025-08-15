@@ -39,6 +39,7 @@ dp.include_router(rt)
 # ─── DATABASE (SQLite) ───────────────────────────────────────────────────────
 def db_init():
     con = sqlite3.connect(DB_PATH)
+    # юзеры как было
     con.execute("""
         CREATE TABLE IF NOT EXISTS users (
             chat_id     INTEGER PRIMARY KEY,
@@ -50,8 +51,20 @@ def db_init():
             last_coupon TEXT
         )
     """)
+    # новая табличка интересов
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS interests (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id    INTEGER NOT NULL,
+            girl_id    INTEGER NOT NULL,
+            source     TEXT,
+            created_at INTEGER NOT NULL
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_interests_pair_time ON interests(chat_id, girl_id, created_at)")
     con.commit()
     con.close()
+
 
 async def db_upsert_user(chat_id: int, username: str | None, first: str | None,
                          last: str | None, reason: str | None, coupon: str | None):
@@ -70,6 +83,28 @@ async def db_upsert_user(chat_id: int, username: str | None, first: str | None,
         con.commit()
         con.close()
     await asyncio.to_thread(_op)
+async def db_add_interest(chat_id: int, girl_id: int, source: str = "deeplink"):
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        con.execute(
+            "INSERT INTO interests (chat_id, girl_id, source, created_at) VALUES (?, ?, ?, ?)",
+            (chat_id, girl_id, source, int(time.time()))
+        )
+        con.commit()
+        con.close()
+    await asyncio.to_thread(_op)
+
+async def db_recent_interest_exists(chat_id: int, girl_id: int, within_sec: int = 86400) -> bool:
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        cur = con.execute(
+            "SELECT 1 FROM interests WHERE chat_id=? AND girl_id=? AND created_at>=?",
+            (chat_id, girl_id, int(time.time()) - within_sec)
+        )
+        row = cur.fetchone()
+        con.close()
+        return row is not None
+    return await asyncio.to_thread(_op)
 
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
 def apply_link(coupon: str | None = None) -> str:
@@ -98,6 +133,23 @@ _manifest_ts = 0.0
 _slots_cache: Dict[str, Any] = {}
 _slots_ts: Dict[str, float] = {}
 TTL = 60  # сек
+def girl_by_id(mf: Dict[str, Any], gid: int) -> Optional[Dict[str, Any]]:
+    """
+    Находит девочку по product ID из манифеста и проставляет _index / _total,
+    чтобы работали кнопки навигации и kb_profile.
+    """
+    arr = girls_list(mf)
+    total = len(arr)
+    for i, x in enumerate(arr):
+        try:
+            if int(x.get("id")) == int(gid):
+                y = x.copy()
+                y["_index"] = i
+                y["_total"] = total
+                return y
+        except Exception:
+            continue
+    return None
 
 async def http_get_json(url: str) -> Any:
     async with aiohttp.ClientSession() as s:
@@ -210,6 +262,7 @@ async def cancel(msg: Message):
     await msg.reply("Окей, отменил. Чем ещё помочь?")
 
 # ─── START (DEEP LINK WITH COUPON) ───────────────────────────────────────────
+
 @rt.message(CommandStart(deep_link=True))
 async def start_with_payload(msg: Message, command: CommandObject):
     payload = (command.args or "").strip()
@@ -217,20 +270,34 @@ async def start_with_payload(msg: Message, command: CommandObject):
 
     reason = "unknown"
     coupon = COUPON_CODE
+    girl_id = None
 
+    # ── парсим payload ───────────────────────────────────────────────────────
     if payload:
+        # 1) base64url JSON: {"g": 62, "coupon": "...", "reason": "..."}
         try:
             data = json.loads(b64url_decode(payload).decode())
-            reason = str(data.get("reason", reason))
-            coupon = str(data.get("coupon", coupon))
+            if "reason" in data:
+                reason = str(data["reason"])
+            if "coupon" in data:
+                coupon = str(data["coupon"])
+            _g = data.get("g") or data.get("girl_id") or data.get("id")
+            if _g is not None:
+                girl_id = int(_g)
         except Exception:
-            parts = payload.split("_", 2)
-            if len(parts) >= 2 and parts[1]:
-                reason = parts[1]
-            if len(parts) >= 3 and parts[2]:
-                coupon = parts[2]
+            # 2) g_62 / girl-62 / girl:62
+            m = re.match(r'^(?:g|girl)[:_\-]?(\d+)$', payload)
+            if m:
+                girl_id = int(m.group(1))
+            # 3) старый формат — ТОЛЬКО если начинается с "exit_"
+            elif payload.startswith("exit_"):
+                parts = payload.split("_", 2)
+                if len(parts) >= 2 and parts[1]:
+                    reason = parts[1]
+                if len(parts) >= 3 and parts[2]:
+                    coupon = parts[2]
 
-    # save user
+    # ── сохраняем юзера ──────────────────────────────────────────────────────
     await db_upsert_user(
         chat_id=msg.chat.id,
         username=msg.from_user.username,
@@ -240,7 +307,66 @@ async def start_with_payload(msg: Message, command: CommandObject):
         coupon=coupon
     )
 
-    # notify admin
+    # ── если пришёл girl_id — сразу показываем анкету ────────────────────────
+    if girl_id is not None:
+        # свежий манифест, ищем девочку
+        mf = await get_manifest(force=True)
+        g  = girl_by_id(mf, girl_id)
+        if not g:
+            await msg.answer("Не нашёл такую анкету 😭", reply_markup=kb_home())
+            return
+
+        # 1) проверка троттлинга: был ли интерес за 24ч (user+girl)
+        should_throttle = False
+        try:
+            should_throttle = await db_recent_interest_exists(msg.chat.id, girl_id, within_sec=24*3600)
+            logging.info("interest check: user=%s girl=%s throttle=%s", msg.chat.id, girl_id, should_throttle)
+        except Exception as e:
+            logging.warning("interest check failed: %s", e)
+
+        # 2) если не душим — уведомляем админа
+        if ADMIN_CHAT_ID and not should_throttle:
+            try:
+                gname = str(g.get("name", f"#{girl_id}"))
+                gurl  = g.get("url") or SHOP_URL
+                text_admin = (
+                    "👀 <b>Интерес к анкете</b>\n"
+                    f"Юзер: <a href=\"tg://user?id={msg.from_user.id}\">{html.escape(msg.from_user.full_name)}</a> "
+                    f"(@{msg.from_user.username or '—'}, ID: <code>{msg.from_user.id}</code>)\n"
+                    f"Девушка: <b>{html.escape(gname)}</b> (ID: <code>{girl_id}</code>)\n"
+                    f"Ссылка: {gurl}\n"
+                    f"Источник: deeplink"
+                )
+                await bot.send_message(ADMIN_CHAT_ID, text_admin, disable_web_page_preview=True)
+                logging.info("admin notified about interest")
+            except Exception as e:
+                logging.warning("admin interest notify failed: %s", e)
+
+        # 3) после уведомления — пишем интерес в базу
+        with suppress(Exception):
+            await db_add_interest(chat_id=msg.chat.id, girl_id=girl_id, source="deeplink")
+
+        # 4) тянем слоты и показываем анкету
+        slots = {}
+        try:
+            if g.get("slot_json"):
+                slots = await get_slots(g["slot_json"])
+        except Exception as e:
+            logging.warning("slots fetch failed: %s", e)
+
+        caption = profile_text(g, slots)
+        kb      = kb_profile(g, slots)
+        img     = g.get("image") or g.get("url")
+
+        try:
+            await msg.answer_photo(photo=img, caption=caption, reply_markup=kb)
+        except Exception as e:
+            logging.warning("answer_photo failed, send text instead: %s", e)
+            await msg.answer(caption, reply_markup=kb)
+
+        return  # ← важно: чтобы не улетел купон ниже
+
+    # ── иначе: классический купон + админ-уведомление ────────────────────────
     if ADMIN_CHAT_ID:
         admin_text = (
             "🎫 <b>/start с купоном</b>\n"
@@ -252,7 +378,6 @@ async def start_with_payload(msg: Message, command: CommandObject):
         with suppress(Exception):
             await bot.send_message(ADMIN_CHAT_ID, admin_text)
 
-    # reply to user (no reason shown)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Применить −10% сейчас", url=apply_link(coupon))],
         [InlineKeyboardButton(text="🛍 Перейти в магазин", url=SHOP_URL)],
