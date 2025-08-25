@@ -76,6 +76,15 @@ def db_init():
         con.execute("ALTER TABLE users ADD COLUMN last_seen INTEGER")
     except Exception:
         pass
+        # interest_once — фиксация, что админу уже слали "Интерес к анкете" для (user,girl)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS interest_once (
+            chat_id    INTEGER NOT NULL,
+            girl_id    INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY(chat_id, girl_id)
+        )
+    """)
 
     # interests
     con.execute("""
@@ -199,6 +208,29 @@ async def db_recent_interest_exists(chat_id: int, girl_id: int, within_sec: int 
             if last > 10**12:  # ~ миллисекунды
                 last //= 1000
             return last >= cutoff
+        finally:
+            con.close()
+    return await asyncio.to_thread(_op)
+async def db_interest_seen_once(chat_id: int, girl_id: int) -> bool:
+    """
+    True  — если для (chat_id, girl_id) уже когда-то слали "Интерес к анкете".
+    False — если ещё не слали (и в этом случае помечаем как слали — один раз и навсегда).
+    """
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        try:
+            cur = con.execute(
+                "SELECT 1 FROM interest_once WHERE chat_id=? AND girl_id=?",
+                (chat_id, girl_id)
+            )
+            exists = cur.fetchone() is not None
+            if not exists:
+                con.execute(
+                    "INSERT INTO interest_once(chat_id, girl_id, created_at) VALUES (?,?,?)",
+                    (chat_id, girl_id, int(time.time()))
+                )
+                con.commit()
+            return exists
         finally:
             con.close()
     return await asyncio.to_thread(_op)
@@ -1611,13 +1643,13 @@ async def start_with_payload(msg: Message, command: CommandObject):
             return
 
         # троттлинг админ-нотификации
-        should_throttle = False
+        already = False
         try:
-            should_throttle = await db_recent_interest_exists(msg.chat.id, girl_id, within_sec=24*3600)
+            already = await db_interest_seen_once(msg.chat.id, girl_id)
         except Exception as e:
-            log.warning("interest check failed: %s", e)
+            log.warning("interest_once check failed: %s", e)
 
-        if ADMIN_CHAT_ID and not should_throttle:
+        if ADMIN_CHAT_ID and not already:
             try:
                 gname = str(g.get("name", f"#{girl_id}"))
                 gurl = g.get("url") or SHOP_URL
@@ -1630,11 +1662,11 @@ async def start_with_payload(msg: Message, command: CommandObject):
                     f"Источник: deeplink"
                 )
                 await bot.send_message(ADMIN_CHAT_ID, text_admin, disable_web_page_preview=True)
-                log.info("ADMIN notify interest sent (source=deeplink, throttled=%s)", should_throttle)
+                log.info("ADMIN notify interest sent (source=deeplink, already=%s)", already)
             except Exception as e:
                 log.warning("admin interest notify failed: %s", e)
         else:
-            log.info("ADMIN notify skipped (source=deeplink). throttled=%s, ADMIN_CHAT_ID=%s", should_throttle, ADMIN_CHAT_ID)
+            log.info("ADMIN notify skipped (source=deeplink). already=%s, ADMIN_CHAT_ID=%s", already, ADMIN_CHAT_ID)
 
         with suppress(Exception):
             await db_add_interest(chat_id=msg.chat.id, girl_id=girl_id, source="deeplink")
@@ -1849,36 +1881,12 @@ async def show_girl(cb: CallbackQuery):
         return
 
     gid = int(g.get("id"))
-    # --- 1) Трекинг интереса + админ-нотификация (антиспам 24ч) ---
-    should_throttle = False
-    try:
-        should_throttle = await db_recent_interest_exists(cb.from_user.id, gid, within_sec=24*3600)
-    except Exception as e:
-        log.warning("interest check failed: %s", e)
 
-    if ADMIN_CHAT_ID and not should_throttle:
-        try:
-            gname = str(g.get("name", f"#{gid}"))
-            gurl  = g.get("url") or SHOP_URL
-            text_admin = (
-                "👀 <b>Интерес к анкете</b>\n"
-                f"Юзер: <a href=\"tg://user?id={cb.from_user.id}\">{html.escape(cb.from_user.full_name)}</a> "
-                f"(@{cb.from_user.username or '—'}, ID: <code>{cb.from_user.id}</code>)\n"
-                f"Девушка: <b>{html.escape(gname)}</b> (ID: <code>{gid}</code>)\n"
-                f"Ссылка: {gurl}\n"
-                f"Источник: browse"
-            )
-            await bot.send_message(ADMIN_CHAT_ID, text_admin, disable_web_page_preview=True)
-            log.info("ADMIN notify interest sent (source=browse, throttled=%s)", should_throttle)
-        except Exception as e:
-            log.warning("admin interest notify failed: %s", e)
-    else:
-        log.info("ADMIN notify skipped (source=browse). throttled=%s, ADMIN_CHAT_ID=%s", should_throttle, ADMIN_CHAT_ID)
-
+    # 1) Только логируем интерес (browse), БЕЗ админ-пинга
     with suppress(Exception):
         await db_add_interest(chat_id=cb.from_user.id, girl_id=gid, source="browse")
 
-    # --- 2) Рендер карточки ---
+    # 2) Рендер карточки
     slots = {}
     try:
         if g.get("slot_json"):
@@ -1900,27 +1908,30 @@ async def show_girl(cb: CallbackQuery):
         await cb.message.answer_photo(photo=img, caption=caption, reply_markup=kb)
         with suppress(Exception):
             await cb.message.delete()
+
     await cb.answer()
 
-    # --- 3) Старт кампании 'girl_interest' ---
+    # 3) Прогрев — по желанию оставляем при browse. 
+    # Если хочешь вырубить — поставь в settings GIRL_INTEREST_ON_BROWSE=0
     try:
-        coupon20 = await settings_get("COUPON_20", COUPON_20)
-        trial    = await settings_get("TRIAL_PRICE", TRIAL_PRICE)
-        girl_ctx = {
-            "coupon20": coupon20,
-            "trial_price": trial,
-            "shop_url": SHOP_URL,
-            "girl_name": g.get("name", ""),
-            "girl_url":  g.get("url") or SHOP_URL,
-        }
-        await run_campaign(
-            chat_id=cb.from_user.id,
-            campaign="girl_interest",
-            ctx=girl_ctx,
-            reason="browse",
-            girl_id=gid,
-            payload_hash=str(gid)
-        )
+        if (await settings_get("GIRL_INTEREST_ON_BROWSE", "1")) == "1":
+            coupon20 = await settings_get("COUPON_20", COUPON_20)
+            trial    = await settings_get("TRIAL_PRICE", TRIAL_PRICE)
+            girl_ctx = {
+                "coupon20": coupon20,
+                "trial_price": trial,
+                "shop_url": SHOP_URL,
+                "girl_name": g.get("name", ""),
+                "girl_url":  g.get("url") or SHOP_URL,
+            }
+            await run_campaign(
+                chat_id=cb.from_user.id,
+                campaign="girl_interest",
+                ctx=girl_ctx,
+                reason="browse",
+                girl_id=gid,
+                payload_hash=str(gid)
+            )
     except Exception as e:
         log.warning("run_campaign(girl_interest) failed: %s", e)
 
