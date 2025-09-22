@@ -17,6 +17,7 @@ from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramBadRequest
 from dotenv import load_dotenv
+
 import random
 
 # ─── ENV ──────────────────────────────────────────────────────────────────────
@@ -76,7 +77,7 @@ def db_init():
         con.execute("ALTER TABLE users ADD COLUMN last_seen INTEGER")
     except Exception:
         pass
-        # interest_once — фиксация, что админу уже слали "Интерес к анкете" для (user,girl)
+    # interest_once — фиксация, что админу уже слали "Интерес к анкете" для (user,girl)
     con.execute("""
         CREATE TABLE IF NOT EXISTS interest_once (
             chat_id    INTEGER NOT NULL,
@@ -151,6 +152,11 @@ def db_init():
     con.commit()
     con.close()
 
+# безопасный “мгновенный” ответ на callback
+async def ack(cb: CallbackQuery, text: str | None = None, alert: bool = False):
+    with suppress(TelegramBadRequest):
+        await cb.answer(text, show_alert=alert)
+
 async def db_upsert_user(chat_id: int, username: str | None, first: str | None,
                          last: str | None, reason: str | None, coupon: str | None):
     now = int(time.time())
@@ -211,6 +217,7 @@ async def db_recent_interest_exists(chat_id: int, girl_id: int, within_sec: int 
         finally:
             con.close()
     return await asyncio.to_thread(_op)
+
 async def db_interest_seen_once(chat_id: int, girl_id: int) -> bool:
     """
     True  — если для (chat_id, girl_id) уже когда-то слали "Интерес к анкете".
@@ -688,7 +695,7 @@ def _girl_order(item: Dict[str, Any]) -> int:
     for k in ("position", "menu_order", "order", "_index"):
         if k in item and item[k] is not None:
             try:
-                return int(item[k])
+                return int(k in item and item[k])
             except Exception:
                 pass
     return 10**9
@@ -951,8 +958,8 @@ async def _send_step(chat_id: int, step: Dict[str, Any], ctx: Dict[str, Any], st
                      campaign: str, reason: str|None, girl_id: int|None, payload_hash: str|None):
     try:
         if step.get("kind") == "photo":
-            img = render_raw(step.get("image",""), ctx)  # ← raw
-            caption = render_html(step.get("caption","") or step.get("text",""), ctx)  # ← html
+            img = render_raw(step.get("image",""), ctx)
+            caption = render_html(step.get("caption","") or step.get("text",""), ctx)
             kb = kb_from([
                 [
                     {
@@ -965,7 +972,7 @@ async def _send_step(chat_id: int, step: Dict[str, Any], ctx: Dict[str, Any], st
             await bot.send_photo(chat_id, photo=img, caption=caption, reply_markup=kb)
             log.info("SEND step ok: chat=%s camp=%s idx=%s kind=photo", chat_id, campaign, step_idx)
         else:
-            text = render_html(step.get("text",""), ctx)  # ← html
+            text = render_html(step.get("text",""), ctx)
             kb = kb_from([
                 [
                     {
@@ -1140,30 +1147,30 @@ async def admin_entry(msg: Message):
 @rt.callback_query(F.data.startswith("adm:"))
 async def admin_cb(cb: CallbackQuery):
     if not is_admin(cb.from_user.id):
-        await cb.answer()
+        await ack(cb)
         return
     await _touch_user(cb.from_user.id)
+    await ack(cb)  # ранний ответ
     parts = cb.data.split(":")
     # adm:menu
     if cb.data == "adm:menu":
         ADMIN_STATE[cb.from_user.id] = {"mode": "menu"}
         await cb.message.edit_text("Админ-панель 👑", reply_markup=kb_admin_menu())
-        await cb.answer(); return
+        return
 
     # adm:camps
     if cb.data == "adm:camps":
         camps = await db_campaigns_list()
         if not camps:
-            await cb.message.edit_text("Кампаний нет.", reply_markup=kb_admin_menu()); await cb.answer(); return
+            await cb.message.edit_text("Кампаний нет.", reply_markup=kb_admin_menu()); return
         rows = [kb_campaign_line(n,t,e) for (n,t,e,cd) in camps]
         rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="adm:menu")])
         await cb.message.edit_text("🧩 Кампании:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-        await cb.answer(); return
+        return
 
     # adm:camp:<name>
     if len(parts) >= 3 and parts[1]=="camp" and parts[2] not in ("toggle","cooldown","test"):
         name = parts[2]
-        # load enabled/cooldown
         camps = await db_campaigns_list()
         enabled, cooldown = 1, CAMPAIGN_COOLDOWN_HOURS
         for n,t,e,cd in camps:
@@ -1171,15 +1178,12 @@ async def admin_cb(cb: CallbackQuery):
                 enabled, cooldown = e, cd
                 break
         await cb.message.edit_text(f"Кампания <b>{html.escape(name)}</b>", reply_markup=kb_campaign_actions(name, enabled, cooldown))
-        await cb.answer(); return
+        return
 
     # toggle
     if len(parts)>=4 and parts[1]=="camp" and parts[2]=="toggle":
         name = parts[3]
         await db_campaign_toggle(name)
-        await cb.answer("Готово")
-        await bot.answer_callback_query(cb.id)
-        # перерисуем
         camps = await db_campaigns_list()
         enabled, cooldown = 1, CAMPAIGN_COOLDOWN_HOURS
         for n,t,e,cd in camps:
@@ -1188,6 +1192,7 @@ async def admin_cb(cb: CallbackQuery):
                 break
         with suppress(Exception):
             await cb.message.edit_reply_markup(reply_markup=kb_campaign_actions(name, enabled, cooldown))
+        await cb.message.answer("Готово ✅")
         return
 
     # cooldown edit
@@ -1195,7 +1200,7 @@ async def admin_cb(cb: CallbackQuery):
         name = parts[3]
         ADMIN_STATE[cb.from_user.id] = {"mode": "edit_cooldown", "campaign": name}
         await cb.message.answer("Введи кулдаун в часах (целое число):")
-        await cb.answer(); return
+        return
 
     # test campaign (send all steps immediately to admin)
     if len(parts)>=4 and parts[1]=="camp" and parts[2]=="test":
@@ -1221,29 +1226,29 @@ async def admin_cb(cb: CallbackQuery):
         if steps is None:
             steps = CAMPAIGNS.get(name, [])
         if not steps:
-            await cb.answer("Пусто"); return
+            await cb.message.answer("Пусто"); return
         for i, step in enumerate(steps):
             try:
                 await _send_step(cb.from_user.id, step, base_ctx, i, name, None, None, "test")
             except Exception as e:
                 log.warning("test send failed: %s", e)
-        await cb.answer("Отправил тест тебе в личку"); return
+        await cb.message.answer("Отправил тест тебе в личку ✅"); return
 
     # steps list
     if len(parts)>=3 and parts[1]=="steps":
         name = parts[2]
         steps = await db_campaign_steps(name)
         await cb.message.edit_text(f"Шаги кампании <b>{html.escape(name)}</b>:", reply_markup=kb_steps_list(name, len(steps)))
-        await cb.answer(); return
+        return
 
     # add step
     if len(parts)>=4 and parts[1]=="step" and parts[2]=="add":
         name = parts[3]
         await db_campaign_step_add(name)
-        await cb.answer("Шаг добавлен")
         steps = await db_campaign_steps(name)
         with suppress(Exception):
             await cb.message.edit_reply_markup(reply_markup=kb_steps_list(name, len(steps)))
+        await cb.message.answer("Шаг добавлен ✅")
         return
 
     # step detail
@@ -1252,7 +1257,7 @@ async def admin_cb(cb: CallbackQuery):
         idx = int(parts[3])
         steps = await db_campaign_steps(name)
         if idx<0 or idx>=len(steps):
-            await cb.answer("Нет такого шага", show_alert=True); return
+            await cb.message.answer("Нет такого шага"); return
         st = steps[idx]
         text = (st.get("text") or "")[:500]
         caption = (st.get("caption") or "")[:300]
@@ -1263,7 +1268,7 @@ async def admin_cb(cb: CallbackQuery):
             f"Image: <code>{html.escape(st.get('image') or '')}</code>\nКнопки: <code>{html.escape(json.dumps(st.get('buttons') or [], ensure_ascii=False))}</code>",
             reply_markup=kb
         )
-        await cb.answer(); return
+        return
 
     # edit fields
     if len(parts)>=6 and parts[1]=="step" and parts[2]=="edit":
@@ -1280,26 +1285,26 @@ async def admin_cb(cb: CallbackQuery):
             "delay": "Введи задержку в секундах (целое число):"
         }.get(field, "Введи значение:")
         await cb.message.answer(prompt)
-        await cb.answer(); return
+        return
 
     # move up/down
     if len(parts)>=5 and parts[1]=="step" and parts[2] in ("moveup","movedown"):
         name = parts[3]; idx = int(parts[4])
         await db_campaign_step_move(name, idx, -1 if parts[2]=="moveup" else +1)
-        await cb.answer("Ок")
         steps = await db_campaign_steps(name)
         with suppress(Exception):
             await cb.message.edit_reply_markup(reply_markup=kb_steps_list(name, len(steps)))
+        await cb.message.answer("Ок ✅")
         return
 
     # delete
     if len(parts)>=5 and parts[1]=="step" and parts[2]=="del":
         name = parts[3]; idx = int(parts[4])
         await db_campaign_step_delete(name, idx)
-        await cb.answer("Удалил")
         steps = await db_campaign_steps(name)
         with suppress(Exception):
             await cb.message.edit_reply_markup(reply_markup=kb_steps_list(name, len(steps)))
+        await cb.message.answer("Удалил 🗑")
         return
 
     # USERS
@@ -1310,18 +1315,18 @@ async def admin_cb(cb: CallbackQuery):
                 f"Активные 30д: <b>{stats['active30']}</b>\n"
                 f"Новые 24ч: <b>{stats['new24']}</b>")
         await cb.message.edit_text(text, reply_markup=kb_users_menu())
-        await cb.answer(); return
+        return
 
     if cb.data == "adm:users:list":
         users = await db_users_list(50)
         if not users:
-            await cb.answer("Пусто"); return
+            await cb.message.answer("Пусто"); return
         lines = []
         for u in users:
             uname = f"@{u['username']}" if u['username'] else "—"
             lines.append(f"• <code>{u['chat_id']}</code> {html.escape(uname)} last_seen={u['last_seen']}")
         await cb.message.answer("\n".join(lines))
-        await cb.answer(); return
+        return
 
     if cb.data == "adm:users:export":
         users = await db_users_list(1000000)
@@ -1332,46 +1337,48 @@ async def admin_cb(cb: CallbackQuery):
                 writer.writerow([u["chat_id"], u["username"], u["first_name"], u["last_name"], u["added_at"], u["last_seen"], u["last_reason"], u["last_coupon"]])
             path = f.name
         await bot.send_document(cb.from_user.id, FSInputFile(path, filename="users_export.csv"))
-        await cb.answer("Экспорт отправил в ЛС"); return
+        await cb.message.answer("Экспорт отправил в ЛС ✅")
+        return
 
     # BCAST
     if cb.data == "adm:bcast":
         BCAST_STATE[cb.from_user.id] = {"segment":"all","text":None,"buttons":None}
         await cb.message.edit_text("📣 Рассылка", reply_markup=kb_bcast_menu())
-        await cb.answer(); return
+        return
 
     if cb.data.startswith("adm:bcast:seg:"):
         seg = cb.data.split(":")[3]
         st = BCAST_STATE.get(cb.from_user.id, {})
         st["segment"] = seg
         BCAST_STATE[cb.from_user.id] = st
-        await cb.answer(f"Сегмент: {seg}")
+        await cb.message.answer(f"Сегмент: {seg}")
         return
 
     if cb.data == "adm:bcast:text":
         BCAST_STATE[cb.from_user.id] = BCAST_STATE.get(cb.from_user.id, {"segment":"all"})
         ADMIN_STATE[cb.from_user.id] = {"mode":"bcast_text"}
         await cb.message.answer("Введи текст рассылки (HTML можно):")
-        await cb.answer(); return
+        return
 
     if cb.data == "adm:bcast:buttons":
         BCAST_STATE[cb.from_user.id] = BCAST_STATE.get(cb.from_user.id, {"segment":"all"})
         ADMIN_STATE[cb.from_user.id] = {"mode":"bcast_buttons"}
         await cb.message.answer('Пришли JSON кнопок, пример: [[{"text":"Открыть","url":"https://..."}]] или "нет"')
-        await cb.answer(); return
+        return
 
     if cb.data == "adm:bcast:test":
         st = BCAST_STATE.get(cb.from_user.id)
         if not st or not st.get("text"):
-            await cb.answer("Сначала введи текст", show_alert=True); return
+            await cb.message.answer("Сначала введи текст"); return
         kb = kb_from(st.get("buttons") or [])
         await bot.send_message(cb.from_user.id, st["text"], reply_markup=kb)
-        await cb.answer("Тест отправлен себе"); return
+        await cb.message.answer("Тест отправлен себе ✅")
+        return
 
     if cb.data == "adm:bcast:send":
         st = BCAST_STATE.get(cb.from_user.id)
         if not st or not st.get("text"):
-            await cb.answer("Нет текста", show_alert=True); return
+            await cb.message.answer("Нет текста"); return
         seg = st.get("segment","all")
         uids = await db_user_ids(seg)
         sent, fail = 0, 0
@@ -1385,7 +1392,7 @@ async def admin_cb(cb: CallbackQuery):
                 fail += 1
             await asyncio.sleep(0.05)
         await cb.message.answer(f"Готово. Ушло: {sent}, ошибок: {fail}")
-        await cb.answer(); return
+        return
 
     # SETTINGS
     if cb.data == "adm:settings":
@@ -1394,13 +1401,13 @@ async def admin_cb(cb: CallbackQuery):
         cd = await settings_get("CAMPAIGN_COOLDOWN_HOURS", str(CAMPAIGN_COOLDOWN_HOURS))
         featured = await settings_get("BESTSELLER_IDS", os.getenv("BESTSELLER_IDS") or os.getenv("BESTSELLER_ID") or "")
         await cb.message.edit_text("⚙️ Настройки", reply_markup=kb_settings_menu(c20, tp, cd, featured))
-        await cb.answer(); return
+        return
 
     if cb.data.startswith("adm:set:"):
         key = cb.data.split(":")[2]
         ADMIN_STATE[cb.from_user.id] = {"mode":"edit_setting", "key": key}
         await cb.message.answer(f"Введи новое значение для {key}:")
-        await cb.answer(); return
+        return
 
 # ─── ADMIN TEXT INPUT HANDLERS ───────────────────────────────────────────────
 @rt.message(F.chat.type == "private", F.from_user.id == ADMIN_CHAT_ID, ~F.text.regexp(r"^/"))
@@ -1863,7 +1870,7 @@ async def start_plain(msg: Message):
 @rt.callback_query(F.data == "home")
 async def back_home(cb: CallbackQuery):
     await _touch_user(cb.from_user.id)
-    await cb.answer()
+    await ack(cb)
     await cb.message.answer("Приветик!", reply_markup=kb_home())
     with suppress(Exception):
         await cb.message.delete()
@@ -1872,12 +1879,13 @@ async def back_home(cb: CallbackQuery):
 @rt.callback_query(F.data.startswith("girls:"))
 async def show_girl(cb: CallbackQuery):
     await _touch_user(cb.from_user.id)
+    await ack(cb)
 
     idx = int(cb.data.split(":")[1])
     mf = await get_manifest()
     g = girl_by_index(mf, idx)
     if not g:
-        await cb.answer("Пока список пуст 😭", show_alert=True)
+        await cb.message.answer("Пока список пуст 😭")
         return
 
     gid = int(g.get("id"))
@@ -1909,10 +1917,7 @@ async def show_girl(cb: CallbackQuery):
         with suppress(Exception):
             await cb.message.delete()
 
-    await cb.answer()
-
-    # 3) Прогрев — по желанию оставляем при browse. 
-    # Если хочешь вырубить — поставь в settings GIRL_INTEREST_ON_BROWSE=0
+    # 3) Прогрев
     try:
         if (await settings_get("GIRL_INTEREST_ON_BROWSE", "1")) == "1":
             coupon20 = await settings_get("COUPON_20", COUPON_20)
@@ -1939,26 +1944,26 @@ async def show_girl(cb: CallbackQuery):
 @rt.callback_query(F.data.startswith("suggest:"))
 async def suggest_start(cb: CallbackQuery):
     await _touch_user(cb.from_user.id)
+    await ack(cb, "Жду время в чате 👇")
     gid = int(cb.data.split(":")[1])
     PENDING_SUGGEST[cb.from_user.id] = gid
     await cb.message.answer(
         "Окей, бро. Кинь время в формате <code>15.08 20:30</code> или <code>2025-08-15 20:30</code>."
         " Если не МСК — укажи пояс (напр. UTC+2)."
     )
-    await cb.answer("Жду время в чате 👇")
 
 @rt.callback_query(F.data == "support")
 async def support_start(cb: CallbackQuery):
     await _touch_user(cb.from_user.id)
     if not ADMIN_CHAT_ID:
-        await cb.answer("Поддержка временно недоступна", show_alert=True)
+        await ack(cb, "Поддержка временно недоступна", alert=True)
         return
+    await ack(cb, "Жду твоё сообщение 👇")
     PENDING_SUPPORT[cb.from_user.id] = True
     await cb.message.answer(
         "Опиши проблему одним сообщением (можно текст/фото/видео/войс/док). "
         "Чтобы отменить — напиши /cancel."
     )
-    await cb.answer("Жду твоё сообщение 👇")
 
 # ─── PRIVATE INBOX (support + suggest + админ-вводы уже обработаны) ─────────
 def _is_time_str(s: str) -> bool:
