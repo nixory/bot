@@ -1919,7 +1919,7 @@ async def show_girl(cb: CallbackQuery):
 
     # 3) Прогрев
     try:
-        if (await settings_get("GIRL_INTEREST_ON_BROWSE", "1")) == "1":
+        if (await settings_get("GIRL_INTEREST_ON_BROWSE", "0")) == "1":
             coupon20 = await settings_get("COUPON_20", COUPON_20)
             trial    = await settings_get("TRIAL_PRICE", TRIAL_PRICE)
             girl_ctx = {
