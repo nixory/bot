@@ -1121,7 +1121,8 @@ def kb_bcast_menu():
         [InlineKeyboardButton(text="Сегмент: все", callback_data="adm:bcast:seg:all")],
         [InlineKeyboardButton(text="Сегмент: активные 7д", callback_data="adm:bcast:seg:active7")],
         [InlineKeyboardButton(text="Сегмент: активные 30д", callback_data="adm:bcast:seg:active30")],
-        [InlineKeyboardButton(text="✏️ Ввести текст", callback_data="adm:bcast:text")],
+        [InlineKeyboardButton(text="✏️ Ввести текст/caption", callback_data="adm:bcast:text")],
+        [InlineKeyboardButton(text="🖼 Добавить фото (URL)", callback_data="adm:bcast:photo")],
         [InlineKeyboardButton(text="🔘 Ввести кнопки (JSON)", callback_data="adm:bcast:buttons")],
         [InlineKeyboardButton(text="▶ Тест (мне)", callback_data="adm:bcast:test")],
         [InlineKeyboardButton(text="📣 Отправить", callback_data="adm:bcast:send")],
@@ -1341,8 +1342,9 @@ async def admin_cb(cb: CallbackQuery):
         return
 
     # BCAST
+   # BCAST
     if cb.data == "adm:bcast":
-        BCAST_STATE[cb.from_user.id] = {"segment":"all","text":None,"buttons":None}
+        BCAST_STATE[cb.from_user.id] = {"segment":"all","text":None,"buttons":None,"photo":None}
         await cb.message.edit_text("📣 Рассылка", reply_markup=kb_bcast_menu())
         return
 
@@ -1354,10 +1356,16 @@ async def admin_cb(cb: CallbackQuery):
         await cb.message.answer(f"Сегмент: {seg}")
         return
 
-    if cb.data == "adm:bcast:text":
+   if cb.data == "adm:bcast:text":
         BCAST_STATE[cb.from_user.id] = BCAST_STATE.get(cb.from_user.id, {"segment":"all"})
         ADMIN_STATE[cb.from_user.id] = {"mode":"bcast_text"}
-        await cb.message.answer("Введи текст рассылки (HTML можно):")
+        await cb.message.answer("Введи текст/caption рассылки (HTML можно):")
+        return
+
+    if cb.data == "adm:bcast:photo":
+        BCAST_STATE[cb.from_user.id] = BCAST_STATE.get(cb.from_user.id, {"segment":"all"})
+        ADMIN_STATE[cb.from_user.id] = {"mode":"bcast_photo"}
+        await cb.message.answer('Пришли URL фото или "нет" чтобы убрать фото:')
         return
 
     if cb.data == "adm:bcast:buttons":
@@ -1366,27 +1374,50 @@ async def admin_cb(cb: CallbackQuery):
         await cb.message.answer('Пришли JSON кнопок, пример: [[{"text":"Открыть","url":"https://..."}]] или "нет"')
         return
 
-    if cb.data == "adm:bcast:test":
+       if cb.data == "adm:bcast:test":
         st = BCAST_STATE.get(cb.from_user.id)
-        if not st or not st.get("text"):
-            await cb.message.answer("Сначала введи текст"); return
+        if not st:
+            await cb.message.answer("Сначала настрой рассылку"); return
+        
+        photo = st.get("photo")
+        text = st.get("text")
         kb = kb_from(st.get("buttons") or [])
-        await bot.send_message(cb.from_user.id, st["text"], reply_markup=kb)
+        
+        if photo:
+            if not text:
+                await cb.message.answer("Нужен текст/caption для фото"); return
+            await bot.send_photo(cb.from_user.id, photo=photo, caption=text, reply_markup=kb)
+        else:
+            if not text:
+                await cb.message.answer("Нужен текст"); return
+            await bot.send_message(cb.from_user.id, text, reply_markup=kb)
+        
         await cb.message.answer("Тест отправлен себе ✅")
         return
 
     if cb.data == "adm:bcast:send":
         st = BCAST_STATE.get(cb.from_user.id)
-        if not st or not st.get("text"):
-            await cb.message.answer("Нет текста"); return
+        if not st:
+            await cb.message.answer("Сначала настрой рассылку"); return
+        
+        photo = st.get("photo")
+        text = st.get("text")
+        
+        if not text:
+            await cb.message.answer("Нет текста/caption"); return
+        
         seg = st.get("segment","all")
         uids = await db_user_ids(seg)
         sent, fail = 0, 0
         kb = kb_from(st.get("buttons") or [])
         await cb.message.answer(f"Начал рассылку по сегменту {seg}. Пользователей: {len(uids)}")
+        
         for uid in uids:
             try:
-                await bot.send_message(uid, st["text"], reply_markup=kb)
+                if photo:
+                    await bot.send_photo(uid, photo=photo, caption=text, reply_markup=kb)
+                else:
+                    await bot.send_message(uid, text, reply_markup=kb)
                 sent += 1
             except Exception:
                 fail += 1
@@ -1485,7 +1516,18 @@ async def admin_text_inputs(msg: Message):
         ADMIN_STATE.pop(msg.from_user.id, None)
         await msg.reply("Текст сохранён ✅")
         return
-
+    # broadcast photo
+    if st and st.get("mode") == "bcast_photo":
+        val = (msg.text or "").strip()
+        bs = BCAST_STATE.get(msg.from_user.id, {"segment":"all"})
+        if val.lower() == "нет":
+            bs["photo"] = None
+        else:
+            bs["photo"] = val
+        BCAST_STATE[msg.from_user.id] = bs
+        ADMIN_STATE.pop(msg.from_user.id, None)
+        await msg.reply("Фото сохранено ✅" if val.lower() != "нет" else "Фото убрано ✅")
+        return
     # broadcast buttons
     if st and st.get("mode") == "bcast_buttons":
         val = (msg.text or "").strip()
