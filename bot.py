@@ -1356,7 +1356,7 @@ async def admin_cb(cb: CallbackQuery):
         await cb.message.answer(f"Сегмент: {seg}")
         return
 
-   if cb.data == "adm:bcast:text":
+    if cb.data == "adm:bcast:text":
         BCAST_STATE[cb.from_user.id] = BCAST_STATE.get(cb.from_user.id, {"segment":"all"})
         ADMIN_STATE[cb.from_user.id] = {"mode":"bcast_text"}
         await cb.message.answer("Введи текст/caption рассылки (HTML можно):")
@@ -1374,24 +1374,27 @@ async def admin_cb(cb: CallbackQuery):
         await cb.message.answer('Пришли JSON кнопок, пример: [[{"text":"Открыть","url":"https://..."}]] или "нет"')
         return
 
-       if cb.data == "adm:bcast:test":
+    if cb.data == "adm:bcast:test":
         st = BCAST_STATE.get(cb.from_user.id)
         if not st:
-            await cb.message.answer("Сначала настрой рассылку"); return
-        
+            await cb.message.answer("Сначала настрой рассылку")
+            return
+
         photo = st.get("photo")
-        text = st.get("text")
-        kb = kb_from(st.get("buttons") or [])
-        
+        text  = st.get("text")
+        kb    = kb_from(st.get("buttons") or [])
+
         if photo:
             if not text:
-                await cb.message.answer("Нужен текст/caption для фото"); return
+                await cb.message.answer("Нужен текст/caption для фото")
+                return
             await bot.send_photo(cb.from_user.id, photo=photo, caption=text, reply_markup=kb)
         else:
             if not text:
-                await cb.message.answer("Нужен текст"); return
+                await cb.message.answer("Нужен текст")
+                return
             await bot.send_message(cb.from_user.id, text, reply_markup=kb)
-        
+
         await cb.message.answer("Тест отправлен себе ✅")
         return
 
