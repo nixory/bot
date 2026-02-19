@@ -49,6 +49,10 @@ WC_CONSUMER_KEY = os.getenv("WC_CONSUMER_KEY", "").strip()
 WC_CONSUMER_SECRET = os.getenv("WC_CONSUMER_SECRET", "").strip()
 WC_DEFAULT_PRODUCT_ID = int(os.getenv("WC_DEFAULT_PRODUCT_ID", "0") or 0)
 WC_FORCE_FEE_ONLY = str(os.getenv("WC_FORCE_FEE_ONLY", "0")).strip().lower() in {"1", "true", "yes", "on"}
+CHECKOUT_API_BASE = (os.getenv("CHECKOUT_API_BASE", f"{SHOP_URL.rstrip('/')}/wp-json/eg-ops/v1") or f"{SHOP_URL.rstrip('/')}/wp-json/eg-ops/v1").strip().rstrip("/")
+OPS_API_BASE = (os.getenv("OPS_API_BASE", "") or "").strip().rstrip("/")  # e.g. https://ops.egirlz.chat/api
+OPS_BOT_SECRET = (os.getenv("OPS_BOT_SECRET", "") or "").strip()
+CHECKOUT_HOLD_TTL = int(os.getenv("CHECKOUT_HOLD_TTL", "600") or 600)
 TG_OPEN_URLS_AS_WEBAPP = str(os.getenv("TG_OPEN_URLS_AS_WEBAPP", "1")).strip().lower() in {"1", "true", "yes", "on"}
 PLATEGA_BASE_URL = (os.getenv("PLATEGA_BASE_URL", "https://app.platega.io") or "https://app.platega.io").strip().rstrip("/")
 PLATEGA_MERCHANT_ID = os.getenv("PLATEGA_MERCHANT_ID", "").strip()
@@ -58,6 +62,10 @@ VIP_CURRENCY = (os.getenv("VIP_CURRENCY", "RUB") or "RUB").strip().upper()
 VIP_PAYMENT_METHOD = int(os.getenv("VIP_PAYMENT_METHOD", "2") or 2)  # 2 = SBP QR
 VIP_RETURN_URL = (os.getenv("VIP_RETURN_URL", f"{SHOP_URL.rstrip('/')}/vip-success") or f"{SHOP_URL.rstrip('/')}/vip-success").strip()
 VIP_FAILED_URL = (os.getenv("VIP_FAILED_URL", f"{SHOP_URL.rstrip('/')}/vip-fail") or f"{SHOP_URL.rstrip('/')}/vip-fail").strip()
+POST_PURCHASE_POLL_SEC = int(os.getenv("POST_PURCHASE_POLL_SEC", "45") or 45)
+POST_PURCHASE_VIP_DISCOUNT_PCT = int(os.getenv("POST_PURCHASE_VIP_DISCOUNT_PCT", "50") or 50)
+POST_PURCHASE_VIP_WINDOW_HOURS = int(os.getenv("POST_PURCHASE_VIP_WINDOW_HOURS", "24") or 24)
+POST_PURCHASE_VIP_CODE = (os.getenv("POST_PURCHASE_VIP_CODE", "VIP50") or "VIP50").strip()
 DB_PATH = os.getenv("DB_PATH", "egirlz_bot.db")  # SQLite файл
 
 COUPON_20 = (os.getenv("COUPON_20", "TODAY20") or "TODAY20").strip()
@@ -184,6 +192,51 @@ def db_init():
         )
     """)
     con.execute("CREATE INDEX IF NOT EXISTS idx_vip_payments_chat ON vip_payments(chat_id, created_at)")
+    # time-limited VIP flash offers after successful checkout payment
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS vip_flash_offers (
+            chat_id       INTEGER PRIMARY KEY,
+            discount_pct  INTEGER NOT NULL,
+            valid_until   INTEGER NOT NULL,
+            created_at    INTEGER NOT NULL,
+            used_at       INTEGER
+        )
+    """)
+    # persistent pending states (survive bot restarts)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS pending_actions (
+            chat_id     INTEGER PRIMARY KEY,
+            action      TEXT NOT NULL,
+            payload     TEXT,
+            updated_at  INTEGER NOT NULL
+        )
+    """)
+    # persistent checkout wizard state (survive bot restarts)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS checkout_sessions (
+            chat_id     INTEGER PRIMARY KEY,
+            state_json  TEXT NOT NULL,
+            updated_at  INTEGER NOT NULL
+        )
+    """)
+    # created checkout orders from bot, used for post-payment automation
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS checkout_orders (
+            order_id            INTEGER PRIMARY KEY,
+            chat_id             INTEGER NOT NULL,
+            girl_id             INTEGER NOT NULL,
+            girl_name           TEXT,
+            amount              REAL,
+            currency            TEXT,
+            status              TEXT NOT NULL DEFAULT 'pending',
+            last_checked_at     INTEGER,
+            post_purchase_sent  INTEGER NOT NULL DEFAULT 0,
+            created_at          INTEGER NOT NULL,
+            paid_at             INTEGER
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_checkout_orders_chat ON checkout_orders(chat_id, created_at)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_checkout_orders_pending ON checkout_orders(post_purchase_sent, status, created_at)")
 
     # campaign log
     con.execute("""
@@ -611,6 +664,167 @@ async def db_favorite_add(chat_id: int, girl_id: int):
         con.close()
     await asyncio.to_thread(_op)
 
+async def db_set_pending_action(chat_id: int, action: str, payload: Optional[Dict[str, Any]] = None):
+    data = json.dumps(payload or {}, ensure_ascii=False)
+    now = int(time.time())
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        con.execute(
+            """
+            INSERT INTO pending_actions(chat_id, action, payload, updated_at)
+            VALUES (?,?,?,?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                action=excluded.action,
+                payload=excluded.payload,
+                updated_at=excluded.updated_at
+            """,
+            (chat_id, action, data, now)
+        )
+        con.commit()
+        con.close()
+    await asyncio.to_thread(_op)
+
+async def db_get_pending_action(chat_id: int) -> Optional[str]:
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        try:
+            cur = con.execute("SELECT action FROM pending_actions WHERE chat_id=?", (chat_id,))
+            row = cur.fetchone()
+            return str(row[0]) if row and row[0] else None
+        finally:
+            con.close()
+    return await asyncio.to_thread(_op)
+
+async def db_clear_pending_action(chat_id: int):
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        con.execute("DELETE FROM pending_actions WHERE chat_id=?", (chat_id,))
+        con.commit()
+        con.close()
+    await asyncio.to_thread(_op)
+
+async def db_checkout_state_set(chat_id: int, state: Dict[str, Any]):
+    payload = json.dumps(state or {}, ensure_ascii=False)
+    now = int(time.time())
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        con.execute(
+            """
+            INSERT INTO checkout_sessions(chat_id, state_json, updated_at)
+            VALUES (?,?,?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                state_json=excluded.state_json,
+                updated_at=excluded.updated_at
+            """,
+            (chat_id, payload, now)
+        )
+        con.commit()
+        con.close()
+    await asyncio.to_thread(_op)
+
+async def db_checkout_state_get(chat_id: int) -> Optional[Dict[str, Any]]:
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        try:
+            cur = con.execute("SELECT state_json FROM checkout_sessions WHERE chat_id=?", (chat_id,))
+            row = cur.fetchone()
+            if not row or not row[0]:
+                return None
+            try:
+                data = json.loads(row[0])
+                return data if isinstance(data, dict) else None
+            except Exception:
+                return None
+        finally:
+            con.close()
+    return await asyncio.to_thread(_op)
+
+async def db_checkout_state_clear(chat_id: int):
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        con.execute("DELETE FROM checkout_sessions WHERE chat_id=?", (chat_id,))
+        con.commit()
+        con.close()
+    await asyncio.to_thread(_op)
+
+async def db_checkout_order_upsert(order_id: int, chat_id: int, girl_id: int, girl_name: str, amount: float, currency: str):
+    now = int(time.time())
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        con.execute(
+            """
+            INSERT INTO checkout_orders(order_id, chat_id, girl_id, girl_name, amount, currency, status, last_checked_at, post_purchase_sent, created_at, paid_at)
+            VALUES (?,?,?,?,?,?, 'pending', NULL, 0, ?, NULL)
+            ON CONFLICT(order_id) DO UPDATE SET
+                chat_id=excluded.chat_id,
+                girl_id=excluded.girl_id,
+                girl_name=excluded.girl_name,
+                amount=excluded.amount,
+                currency=excluded.currency
+            """,
+            (order_id, chat_id, girl_id, girl_name, float(amount), currency, now)
+        )
+        con.commit()
+        con.close()
+    await asyncio.to_thread(_op)
+
+async def db_checkout_orders_pending(limit: int = 40) -> List[Dict[str, Any]]:
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        try:
+            cur = con.execute(
+                """
+                SELECT order_id, chat_id, girl_id, girl_name, amount, currency, status, created_at
+                FROM checkout_orders
+                WHERE post_purchase_sent=0
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (int(limit),)
+            )
+            out: List[Dict[str, Any]] = []
+            for row in cur.fetchall():
+                out.append({
+                    "order_id": int(row[0]),
+                    "chat_id": int(row[1]),
+                    "girl_id": int(row[2]),
+                    "girl_name": str(row[3] or ""),
+                    "amount": float(row[4] or 0.0),
+                    "currency": str(row[5] or "RUB"),
+                    "status": str(row[6] or "pending"),
+                    "created_at": int(row[7] or 0),
+                })
+            return out
+        finally:
+            con.close()
+    return await asyncio.to_thread(_op)
+
+async def db_checkout_order_status(order_id: int, status: str, paid: bool, mark_post_purchase_sent: bool = False):
+    now = int(time.time())
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        if mark_post_purchase_sent:
+            con.execute(
+                """
+                UPDATE checkout_orders
+                SET status=?, last_checked_at=?, post_purchase_sent=1, paid_at=COALESCE(paid_at, ?)
+                WHERE order_id=?
+                """,
+                (status, now, now if paid else None, order_id)
+            )
+        else:
+            con.execute(
+                """
+                UPDATE checkout_orders
+                SET status=?, last_checked_at=?, paid_at=COALESCE(paid_at, ?)
+                WHERE order_id=?
+                """,
+                (status, now, now if paid else None, order_id)
+            )
+        con.commit()
+        con.close()
+    await asyncio.to_thread(_op)
+
 async def db_favorite_remove(chat_id: int, girl_id: int):
     def _op():
         con = sqlite3.connect(DB_PATH)
@@ -878,12 +1092,65 @@ async def db_add_vip_payment(chat_id: int, transaction_id: str | None, amount: f
         con.close()
     await asyncio.to_thread(_op)
 
-async def platega_create_vip_payment(user) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+async def db_set_vip_flash_offer(chat_id: int, discount_pct: int, valid_hours: int):
+    now = int(time.time())
+    valid_until = now + max(1, int(valid_hours)) * 3600
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        con.execute(
+            """
+            INSERT INTO vip_flash_offers(chat_id, discount_pct, valid_until, created_at, used_at)
+            VALUES (?,?,?,?,NULL)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                discount_pct=excluded.discount_pct,
+                valid_until=excluded.valid_until,
+                created_at=excluded.created_at,
+                used_at=NULL
+            """,
+            (chat_id, int(discount_pct), valid_until, now)
+        )
+        con.commit()
+        con.close()
+    await asyncio.to_thread(_op)
+
+async def db_get_vip_flash_offer(chat_id: int) -> Optional[Dict[str, Any]]:
+    now = int(time.time())
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        try:
+            cur = con.execute(
+                "SELECT discount_pct, valid_until, used_at FROM vip_flash_offers WHERE chat_id=?",
+                (chat_id,)
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            discount_pct = int(row[0] or 0)
+            valid_until = int(row[1] or 0)
+            used_at = row[2]
+            if discount_pct <= 0 or valid_until <= now or used_at is not None:
+                return None
+            return {"discount_pct": discount_pct, "valid_until": valid_until}
+        finally:
+            con.close()
+    return await asyncio.to_thread(_op)
+
+async def db_mark_vip_flash_offer_used(chat_id: int):
+    now = int(time.time())
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        con.execute("UPDATE vip_flash_offers SET used_at=? WHERE chat_id=? AND used_at IS NULL", (now, chat_id))
+        con.commit()
+        con.close()
+    await asyncio.to_thread(_op)
+
+async def platega_create_vip_payment(user, amount: Optional[float] = None) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """
     Returns: (redirect_url, transaction_id, status)
     """
     if not platega_enabled():
         return None, None, None
+    amount_to_charge = float(amount if amount is not None else VIP_PRICE)
 
     payload_info = {
         "source": "telegram_bot",
@@ -894,10 +1161,10 @@ async def platega_create_vip_payment(user) -> Tuple[Optional[str], Optional[str]
     body = {
         "paymentMethod": VIP_PAYMENT_METHOD,
         "paymentDetails": {
-            "amount": float(VIP_PRICE),
+            "amount": amount_to_charge,
             "currency": VIP_CURRENCY
         },
-        "description": f"VIP подписка EGIRLZ для Telegram user {user.id}",
+        "description": f"VIP подписка EGIRLZ для Telegram user {user.id} ({amount_to_charge:.2f} {VIP_CURRENCY})",
         "return": VIP_RETURN_URL,
         "failedUrl": VIP_FAILED_URL,
         "payload": json.dumps(payload_info, ensure_ascii=False),
@@ -943,10 +1210,222 @@ def apply_link(coupon: str | None = None) -> str:
 def wc_enabled() -> bool:
     return bool(WC_API_URL and WC_CONSUMER_KEY and WC_CONSUMER_SECRET)
 
+def checkout_enabled() -> bool:
+    return wc_enabled() and bool(CHECKOUT_API_BASE)
+
 def wc_store_base_url() -> str:
     if WC_API_URL and "/wp-json/" in WC_API_URL:
         return WC_API_URL.split("/wp-json/", 1)[0].rstrip("/")
     return SHOP_URL.rstrip("/")
+
+CHECKOUT_STATE: Dict[int, Dict[str, Any]] = {}
+
+def _checkout_default_stage() -> str:
+    return "plans"
+
+async def checkout_state_set(uid: int, state: Dict[str, Any]):
+    if not isinstance(state, dict):
+        return
+    state["stage"] = str(state.get("stage") or _checkout_default_stage())
+    CHECKOUT_STATE[uid] = state
+    await db_checkout_state_set(uid, state)
+
+async def checkout_state_clear(uid: int):
+    CHECKOUT_STATE.pop(uid, None)
+    await db_checkout_state_clear(uid)
+
+async def checkout_state_get(uid: int) -> Optional[Dict[str, Any]]:
+    state = CHECKOUT_STATE.get(uid)
+    if isinstance(state, dict):
+        return state
+    db_state = await db_checkout_state_get(uid)
+    if isinstance(db_state, dict):
+        CHECKOUT_STATE[uid] = db_state
+        return db_state
+    return None
+
+def checkout_api_url(path: str) -> str:
+    return f"{CHECKOUT_API_BASE}/{path.lstrip('/')}"
+
+async def checkout_get(path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    url = checkout_api_url(path)
+    try:
+        async with aiohttp.ClientSession(connector=build_http_connector()) as s:
+            async with s.get(url, params=params or {}, timeout=25) as r:
+                txt = await r.text()
+                if r.status >= 400:
+                    return None, f"HTTP {r.status}: {txt[:300]}"
+                return json.loads(txt), None
+    except Exception as e:
+        return None, str(e)
+
+async def checkout_post(path: str, payload: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    url = checkout_api_url(path)
+    try:
+        async with aiohttp.ClientSession(connector=build_http_connector()) as s:
+            async with s.post(url, json=payload, timeout=25) as r:
+                txt = await r.text()
+                if r.status >= 400:
+                    return None, f"HTTP {r.status}: {txt[:300]}"
+                return json.loads(txt), None
+    except Exception as e:
+        return None, str(e)
+
+async def checkout_product_config(product_id: int) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    data, err = await checkout_get("product-config", {"product_id": product_id})
+    if err:
+        return None, err
+    if not isinstance(data, dict) or not data.get("ok"):
+        return None, "Некорректный ответ product-config"
+    return data, None
+
+async def checkout_slots(worker_id: int, days: int = 30) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    data, err = await checkout_get("slots", {"worker_id": worker_id, "days": days})
+    if err:
+        return None, err
+    if not isinstance(data, dict) or not data.get("ok"):
+        return None, "Некорректный ответ slots"
+    calendar = data.get("calendar") or []
+    if not isinstance(calendar, list):
+        calendar = []
+    return calendar, None
+
+async def checkout_hold(worker_id: int, date_s: str, start: str, end: str) -> Tuple[Optional[str], Optional[str]]:
+    data, err = await checkout_post("hold", {
+        "worker_id": worker_id,
+        "date": date_s,
+        "start": start,
+        "end": end,
+        "ttl": CHECKOUT_HOLD_TTL,
+    })
+    if err:
+        return None, err
+    if not isinstance(data, dict) or not data.get("ok"):
+        return None, "Не удалось удержать слот"
+    hold = data.get("hold") or {}
+    token = str((hold or {}).get("token") or "").strip()
+    if not token:
+        return None, "Не получили токен hold"
+    return token, None
+
+def _step_minutes_for_plan(plan: Dict[str, Any]) -> int:
+    try:
+        mins = int(plan.get("base_step_minutes") or 60)
+    except Exception:
+        mins = 60
+    return 30 if mins <= 30 else 60
+
+def _to_minutes(hhmm: str) -> Optional[int]:
+    m = re.match(r"^(\d{1,2}):(\d{2})$", str(hhmm or "").strip())
+    if not m:
+        return None
+    hh, mm = int(m.group(1)), int(m.group(2))
+    if hh < 0 or hh > 23 or mm < 0 or mm > 59:
+        return None
+    return hh * 60 + mm
+
+def _hhmm(minutes: int) -> str:
+    x = minutes % 1440
+    return f"{x // 60:02d}:{x % 60:02d}"
+
+def _build_sessions_for_date(raw_slots: List[Dict[str, Any]], date_s: str, duration_minutes: int, step_minutes: int) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    seen: set[str] = set()
+    for row in raw_slots:
+        if not isinstance(row, dict):
+            continue
+        if row.get("available") is False:
+            continue
+        start_m = _to_minutes(str(row.get("start") or ""))
+        end_m = _to_minutes(str(row.get("end") or ""))
+        if start_m is None or end_m is None:
+            continue
+        if end_m <= start_m:
+            end_m = 1440
+        cur = start_m
+        while cur + duration_minutes <= end_m:
+            s = _hhmm(cur)
+            e = _hhmm(cur + duration_minutes)
+            k = f"{s}|{e}"
+            if k not in seen:
+                seen.add(k)
+                out.append({"date": date_s, "start": s, "end": e, "label": f"{s} - {e}"})
+            cur += step_minutes
+    out.sort(key=lambda x: x.get("start", ""))
+    return out
+
+def _checkout_price(plan: Dict[str, Any], hours: int, selected_addon_ids: List[str]) -> Tuple[float, List[str]]:
+    price_per_hour = float(plan.get("price_per_hour") or 0.0)
+    base_total = price_per_hour * max(1, int(hours))
+    fixed = 0.0
+    mult = 0.0
+    labels: List[str] = []
+
+    addons = plan.get("addons") or []
+    selected = set(selected_addon_ids or [])
+    for addon in addons:
+        if not isinstance(addon, dict):
+            continue
+        aid = str(addon.get("id") or "")
+        if aid not in selected:
+            continue
+        label = str(addon.get("label") or "").strip()
+        if label:
+            labels.append(label)
+        typ = str(addon.get("type") or "fixed")
+        val = float(addon.get("value") or 0.0)
+        if typ == "multiply_percent":
+            mult += (val / 100.0)
+        else:
+            fixed += val
+
+    total_before = base_total + fixed
+    total = total_before * (1.0 + mult)
+    return round(total, 2), labels
+
+def _plan_features_text(plan: Dict[str, Any], max_items: int = 12) -> str:
+    yes_rows = plan.get("features_yes") or []
+    no_rows = plan.get("features_no") or []
+    lines: List[str] = []
+
+    for row in yes_rows:
+        if not isinstance(row, dict):
+            continue
+        txt = str(row.get("text") or "").strip()
+        if txt:
+            lines.append(f"✅ {txt}")
+        if len(lines) >= max_items:
+            break
+
+    if len(lines) < max_items:
+        for row in no_rows:
+            if not isinstance(row, dict):
+                continue
+            txt = str(row.get("text") or "").strip()
+            if txt:
+                lines.append(f"🚫 {txt}")
+            if len(lines) >= max_items:
+                break
+
+    return "\n".join(lines)
+
+def _plan_addons_text(plan: Dict[str, Any]) -> str:
+    addons = plan.get("addons") or []
+    if not isinstance(addons, list) or not addons:
+        return "Для этого тарифа доп. услуг пока нет."
+
+    lines: List[str] = []
+    for addon in addons:
+        if not isinstance(addon, dict):
+            continue
+        label = str(addon.get("label") or "").strip()
+        if not label:
+            continue
+        typ = str(addon.get("type") or "fixed")
+        val = float(addon.get("value") or 0.0)
+        suffix = f"+{int(val)}₽" if typ == "fixed" else f"+{int(val)}%"
+        lines.append(f"• {label} ({suffix})")
+    return "\n".join(lines) if lines else "Для этого тарифа доп. услуг пока нет."
 
 def _girl_checkout_price(g: Dict[str, Any]) -> float:
     for k in ("from_price", "price"):
@@ -959,7 +1438,7 @@ def _girl_checkout_price(g: Dict[str, Any]) -> float:
             pass
     return 0.0
 
-async def wc_create_order_for_girl(user, g: Dict[str, Any]) -> Tuple[Optional[int], Optional[str]]:
+async def wc_create_order_for_girl(user, g: Dict[str, Any], checkout: Optional[Dict[str, Any]] = None) -> Tuple[Optional[int], Optional[str]]:
     """
     Creates WooCommerce order and returns (order_id, payment_url).
     payment_url can be None when order creation failed.
@@ -967,10 +1446,18 @@ async def wc_create_order_for_girl(user, g: Dict[str, Any]) -> Tuple[Optional[in
     if not wc_enabled():
         return None, None
 
-    price = _girl_checkout_price(g)
-    currency = str(g.get("currency") or "RUB")
-    product_id = int(g.get("wc_product_id") or WC_DEFAULT_PRODUCT_ID or 0)
+    price = float((checkout or {}).get("price") or _girl_checkout_price(g) or 0.0)
+    currency = str((checkout or {}).get("currency") or g.get("currency") or "RUB")
+    product_id = int((checkout or {}).get("product_id") or g.get("wc_product_id") or WC_DEFAULT_PRODUCT_ID or 0)
     gname = str(g.get("name", "E-Girl"))
+    plan_name = str((checkout or {}).get("plan_name") or "")
+    hours_val = str((checkout or {}).get("hours") or "")
+    addons_text = str((checkout or {}).get("addons_text") or "").strip()
+    booking_date = str((checkout or {}).get("date") or "").strip()
+    booking_start = str((checkout or {}).get("start") or "").strip()
+    booking_end = str((checkout or {}).get("end") or "").strip()
+    booking_worker_id = int((checkout or {}).get("worker_id") or 0)
+    hold_token = str((checkout or {}).get("hold_token") or "").strip()
 
     payload: Dict[str, Any] = {
         "status": "pending",
@@ -990,16 +1477,36 @@ async def wc_create_order_for_girl(user, g: Dict[str, Any]) -> Tuple[Optional[in
             {"key": "girl_name", "value": gname},
         ],
     }
+    if booking_date and booking_start and booking_end:
+        payload["meta_data"].append({"key": "billing_time", "value": f"{booking_date} {booking_start}-{booking_end}"})
 
     if price > 0:
         if product_id > 0 and not WC_FORCE_FEE_ONLY:
-            payload["line_items"] = [{
+            line_item: Dict[str, Any] = {
                 "product_id": product_id,
                 "quantity": 1,
                 "subtotal": f"{price:.2f}",
                 "total": f"{price:.2f}",
                 "name": f"E-Girl booking: {gname}",
-            }]
+            }
+            line_meta = []
+            if plan_name:
+                line_meta.append({"key": "План", "value": plan_name})
+            if hours_val:
+                line_meta.append({"key": "Часы", "value": hours_val})
+            if addons_text:
+                line_meta.append({"key": "Дополнительно", "value": addons_text})
+            if booking_date:
+                line_meta.append({"key": "Дата сессии", "value": booking_date})
+            if booking_start and booking_end:
+                line_meta.append({"key": "Время сессии", "value": f"{booking_start}-{booking_end}"})
+            if booking_worker_id > 0:
+                line_meta.append({"key": "ID работницы", "value": str(booking_worker_id)})
+            if hold_token:
+                line_meta.append({"key": "_booking_hold_token", "value": hold_token})
+            if line_meta:
+                line_item["meta_data"] = line_meta
+            payload["line_items"] = [line_item]
         else:
             payload["fee_lines"] = [{
                 "name": f"E-Girl booking: {gname}",
@@ -1028,6 +1535,22 @@ async def wc_create_order_for_girl(user, g: Dict[str, Any]) -> Tuple[Optional[in
             f"?pay_for_order=true&key={quote_plus(str(data.get('order_key')))}"
         )
     return order_id, (str(payment_url) if payment_url else None)
+
+async def wc_get_order_status(order_id: int) -> Tuple[Optional[str], Optional[str]]:
+    if not wc_enabled() or order_id <= 0:
+        return None, "woo disabled"
+    try:
+        auth = aiohttp.BasicAuth(WC_CONSUMER_KEY, WC_CONSUMER_SECRET)
+        async with aiohttp.ClientSession(auth=auth, connector=build_http_connector()) as s:
+            async with s.get(f"{WC_API_URL.rstrip('/')}/orders/{int(order_id)}", timeout=20) as r:
+                txt = await r.text()
+                if r.status >= 400:
+                    return None, f"HTTP {r.status}: {txt[:300]}"
+                data = json.loads(txt)
+    except Exception as e:
+        return None, str(e)
+    status = str((data or {}).get("status") or "").strip().lower()
+    return (status or None), None
 
 def b64url_decode(s: str) -> bytes:
     s = s.replace('-', '+').replace('_', '/')
@@ -1163,51 +1686,7 @@ def profile_text(g: Dict[str, Any], slots: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 def build_social_proof(g: Dict[str, Any]) -> List[str]:
-    acf = (g.get("acf") or {})
-
-    rating_raw = g.get("rating") or acf.get("rating")
-    bookings_raw = g.get("bookings_count") or acf.get("bookings_count") or g.get("orders_count")
-    review_raw = acf.get("review_short") or acf.get("review") or g.get("review")
-    best_for_raw = acf.get("best_for") or g.get("best_for")
-
-    cats = set(_cat_slugs(g))
-    if rating_raw is None:
-        if "bestseller" in cats:
-            rating = "в топе каталога"
-        elif "main" in cats:
-            rating = "рекомендуемая анкета"
-        else:
-            rating = "новые отзывы добавляются"
-    else:
-        rating = str(rating_raw)
-
-    if bookings_raw is None:
-        bookings = "по запросу"
-    else:
-        bookings = str(bookings_raw)
-
-    if not review_raw:
-        review = "Приятный вайб и комфортное общение."
-    else:
-        review = str(review_raw).strip()
-        if len(review) > 120:
-            review = review[:117].rsplit(" ", 1)[0] + "..."
-
-    if not best_for_raw:
-        games = acf.get("favorite_games") or []
-        if isinstance(games, list) and games:
-            best_for = "совместных игр и тёплого общения"
-        else:
-            best_for = "уютного общения и приятного вечера"
-    else:
-        best_for = str(best_for_raw).strip()
-
-    return [
-        f"⭐ Рейтинг: {html.escape(rating)}",
-        f"🏆 Бронирований: {html.escape(bookings)}",
-        f"💬 Отзыв: {html.escape(review)}",
-        f"🎯 Лучший выбор для: {html.escape(best_for)}",
-    ]
+    return []
 
 def _parse_slot_dt(date_s: str | None, time_s: str | None) -> Optional[datetime]:
     if not date_s or not time_s:
@@ -2034,13 +2513,10 @@ def kb_profile(g: dict, slots: dict, is_favorite: bool = False, is_slot_subscrib
     total = max(1, g.get("_total", 1))
     prev_idx = (idx - 1) % total
     next_idx = (idx + 1) % total
-    booking_url = slots.get("scheduling_url") or g.get("url")
     has_slots = len(collect_available_slots(g, slots)) > 0
 
-    if wc_enabled():
-        booking_btn = InlineKeyboardButton(text="⚡ Забронировать E-Girl", callback_data=f"pay:start:{g['id']}")
-    else:
-        booking_btn = link_button("⚡ Забронировать E-Girl", booking_url)
+    # Всегда запускаем бот-флоу бронирования из анкеты.
+    booking_btn = InlineKeyboardButton(text="⚡ Забронировать E-Girl", callback_data=f"pay:start:{g['id']}")
     rows = [[booking_btn]]
     rows.append([
         InlineKeyboardButton(
@@ -2062,6 +2538,64 @@ def kb_profile(g: dict, slots: dict, is_favorite: bool = False, is_slot_subscrib
         [InlineKeyboardButton(text="🏠 В меню", callback_data="home")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def _date_ru(ymd: str) -> str:
+    try:
+        return datetime.strptime(ymd, "%Y-%m-%d").strftime("%d.%m")
+    except Exception:
+        return ymd
+
+def kb_checkout_plans(gid: int, plans: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    for idx, plan in enumerate(plans):
+        name = str(plan.get("name") or f"План {idx + 1}").upper()
+        price = int(float(plan.get("price_per_hour") or 0))
+        rows.append([InlineKeyboardButton(text=f"{name} — {price}₽/ч", callback_data=f"pay:plan:{gid}:{idx}")])
+    rows.append([InlineKeyboardButton(text="🏠 В меню", callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def kb_checkout_hours(gid: int, options: List[int]) -> InlineKeyboardMarkup:
+    opts = [int(x) for x in (options or [1, 2, 3, 4, 5]) if int(x) > 0]
+    if not opts:
+        opts = [1, 2, 3, 4, 5]
+    rows = [[InlineKeyboardButton(text=f"{h} ч", callback_data=f"pay:hours:{gid}:{h}") ] for h in opts[:8]]
+    rows.append([InlineKeyboardButton(text="⬅️ Назад к планам", callback_data=f"pay:plans:{gid}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def kb_checkout_addons(gid: int, plan: Dict[str, Any], selected_ids: List[str]) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    selected = set(selected_ids or [])
+    addons = plan.get("addons") or []
+    for idx, addon in enumerate(addons):
+        if not isinstance(addon, dict):
+            continue
+        aid = str(addon.get("id") or f"a{idx}")
+        label = str(addon.get("label") or f"Доп {idx+1}")
+        typ = str(addon.get("type") or "fixed")
+        val = float(addon.get("value") or 0.0)
+        suffix = f"+{int(val)}₽" if typ == "fixed" else f"+{int(val)}%"
+        mark = "✅ " if aid in selected else "☑️ "
+        rows.append([InlineKeyboardButton(text=f"{mark}{label} ({suffix})", callback_data=f"pay:addon:{gid}:{idx}")])
+    rows.append([InlineKeyboardButton(text="➡️ Далее к дате", callback_data=f"pay:addondone:{gid}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад к часам", callback_data=f"pay:hoursback:{gid}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def kb_checkout_dates(gid: int, dates: List[str]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=_date_ru(d), callback_data=f"pay:date:{gid}:{d.replace('-', '')}")] for d in dates[:14]]
+    rows.append([InlineKeyboardButton(text="⬅️ Назад к допам", callback_data=f"pay:addons:{gid}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def kb_checkout_slots(gid: int, date_s: str, slots: List[Dict[str, str]]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=s.get("label", ""), callback_data=f"pay:slot:{gid}:{idx}")] for idx, s in enumerate(slots[:16])]
+    rows.append([InlineKeyboardButton(text="⬅️ Назад к датам", callback_data=f"pay:dates:{gid}")])
+    rows.append([InlineKeyboardButton(text=f"🗓 Дата: {_date_ru(date_s)}", callback_data="noop")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def kb_checkout_resume() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="▶️ Продолжить бронирование", callback_data="pay:resume")],
+        [InlineKeyboardButton(text="🧹 Начать заново", callback_data="pay:resume:discard")],
+    ])
 
 # ─── SIMPLE FSMs ─────────────────────────────────────────────────────────────
 PENDING_SUGGEST: Dict[int, int] = {}   # user_id -> girl_id
@@ -2574,6 +3108,9 @@ async def cancel(msg: Message):
     FIND_STATE.pop(msg.from_user.id, None)
     ADMIN_STATE.pop(msg.from_user.id, None)
     BCAST_STATE.pop(msg.from_user.id, None)
+    CHECKOUT_STATE.pop(msg.from_user.id, None)
+    await db_clear_pending_action(msg.from_user.id)
+    await db_checkout_state_clear(msg.from_user.id)
     await msg.reply("Окей, отменил. Чем ещё помочь?")
 
 @rt.message(Command("reply"))
@@ -2625,6 +3162,24 @@ async def cmd_diag(msg: Message):
         t = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
         lines.append(f"• {t} | {camp} step={idx} reason={rs or '—'} girl={gid or '—'} payload={ph or '—'}")
     await msg.reply("\n".join(lines))
+
+async def maybe_prompt_resume_checkout_msg(msg: Message) -> bool:
+    state = await checkout_state_get(msg.from_user.id)
+    if not isinstance(state, dict):
+        return False
+    gid = int(state.get("gid") or 0)
+    girl_name = str(state.get("girl_name") or "")
+    if gid <= 0:
+        await checkout_state_clear(msg.from_user.id)
+        return False
+    title = html.escape(girl_name) if girl_name else f"ID {gid}"
+    await msg.answer(
+        "Ты не завершил бронирование.\n"
+        f"Анкета: <b>{title}</b>\n\n"
+        "Продолжить с того же шага?",
+        reply_markup=kb_checkout_resume(),
+    )
+    return True
 
 # ─── START (DEEP LINK WITH COUPON / GIRL) ────────────────────────────────────
 @rt.message(CommandStart(deep_link=True))
@@ -2695,6 +3250,62 @@ async def start_with_payload(msg: Message, command: CommandObject):
         "shop_url": SHOP_URL,
         "trial_price": trial,
     }
+
+    # ── order tracking deep link: /start order_<woo_order_id> ──────────────
+    if payload.startswith("order_"):
+        woo_order_id = payload.removeprefix("order_")
+
+        if not woo_order_id.isdigit():
+            await msg.answer("Некорректная ссылка заказа. Открой страницу оплаты и попробуй снова.")
+            return
+
+        if not OPS_API_BASE:
+            log.error(
+                "order deep-link skipped: OPS_API_BASE is empty; payload=%r user_id=%s",
+                payload,
+                msg.from_user.id,
+            )
+            await msg.answer(
+                "Трекинг заказа сейчас недоступен (не настроен API).\n"
+                "Напиши в поддержку, мы привяжем заказ вручную."
+            )
+            return
+
+        headers = {"X-Bot-Secret": OPS_BOT_SECRET} if OPS_BOT_SECRET else {}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{OPS_API_BASE}/bot/link-order",
+                    json={
+                        "woo_order_id":  int(woo_order_id),
+                        "tg_chat_id":    str(msg.chat.id),
+                        "tg_username":   msg.from_user.username or "",
+                        "tg_first_name": msg.from_user.first_name or "",
+                    },
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status == 200:
+                        log.info("order link OK: woo_order_id=%s chat_id=%s", woo_order_id, msg.chat.id)
+                        await msg.answer(
+                            f"Заказ <code>#{woo_order_id}</code> привязан к этому чату ✅\n"
+                            "Дальше буду присылать статусы прямо сюда."
+                        )
+                    elif resp.status == 404:
+                        log.warning("order link 404: woo_order_id=%s", woo_order_id)
+                        await msg.answer("Заказ не найден. Попробуйте позже или напишите в поддержку.")
+                    elif resp.status == 401:
+                        body = await resp.text()
+                        log.warning("order link 401: body=%s", body[:200])
+                        await msg.answer("Ошибка авторизации трекинга. Поддержка уже получила сигнал.")
+                    else:
+                        body = await resp.text()
+                        log.warning("order link error %s: %s", resp.status, body[:200])
+                        await msg.answer("Ошибка при подключении заказа. Попробуйте позже.")
+        except Exception as e:
+            log.warning("order link request failed: %s", e)
+            await msg.answer("Не удалось подключиться к серверу. Попробуйте позже.")
+        return
 
     # если пришёл girl_id — карточка и прогрев
     if girl_id is not None:
@@ -2929,6 +3540,8 @@ async def start_plain(msg: Message):
         reason=None,
         coupon=None
     )
+    if await maybe_prompt_resume_checkout_msg(msg):
+        return
     await msg.answer("Привет 😏\nКто сегодня свободен для тебя?", reply_markup=kb_home())
 
 # ─── HOME BTN ────────────────────────────────────────────────────────────────
@@ -2936,19 +3549,76 @@ async def start_plain(msg: Message):
 async def back_home(cb: CallbackQuery):
     await _touch_user(cb.from_user.id)
     await ack(cb)
+    await checkout_state_clear(cb.from_user.id)
     await cb.message.answer("Привет 😏\nКто сегодня свободен для тебя?", reply_markup=kb_home())
     with suppress(Exception):
         await cb.message.delete()
 
+@rt.callback_query(F.data == "pay:resume")
+async def checkout_resume(cb: CallbackQuery):
+    await _touch_user(cb.from_user.id)
+    await ack(cb)
+    s = await checkout_state_get(cb.from_user.id)
+    if not s:
+        await cb.message.answer("Незавершённого бронирования не найдено. Начни заново из анкеты.")
+        return
+    gid = int(s.get("gid") or 0)
+    plans = s.get("plans") or []
+    pidx = int(s.get("plan_idx") or 0)
+    stage = str(s.get("stage") or "plans")
+    if gid <= 0 or not plans:
+        await checkout_state_clear(cb.from_user.id)
+        await cb.message.answer("Старая сессия недействительна. Начни бронирование заново.")
+        return
+    if pidx < 0 or pidx >= len(plans):
+        pidx = 0
+        s["plan_idx"] = 0
+
+    if stage == "hours":
+        opts = plans[pidx].get("hours_options") or [1, 2, 3, 4, 5]
+        await cb.message.answer("Продолжаем. Выбери количество часов:", reply_markup=kb_checkout_hours(gid, opts))
+        return
+    if stage == "addons":
+        plan = plans[pidx]
+        plan_addons = _plan_addons_text(plan)
+        await cb.message.answer(
+            f"Продолжаем.\nДоп. услуги тарифа:\n{html.escape(plan_addons)}\n\nВыбери доп. опции:",
+            reply_markup=kb_checkout_addons(gid, plan, s.get("selected_addons") or []),
+        )
+        return
+    if stage == "dates":
+        await _checkout_render_dates(cb, gid, s)
+        return
+    if stage == "slots":
+        date_s = str(s.get("selected_date") or "")
+        slots = (s.get("date_slots") or {}).get(date_s) or []
+        if slots and date_s:
+            await cb.message.answer(
+                f"Продолжаем. Выбери слот на <b>{_date_ru(date_s)}</b>:",
+                reply_markup=kb_checkout_slots(gid, date_s, slots),
+            )
+            return
+        await _checkout_render_dates(cb, gid, s)
+        return
+
+    await cb.message.answer("Продолжаем. Выбери тариф:", reply_markup=kb_checkout_plans(gid, plans))
+
+@rt.callback_query(F.data == "pay:resume:discard")
+async def checkout_resume_discard(cb: CallbackQuery):
+    await _touch_user(cb.from_user.id)
+    await ack(cb)
+    await checkout_state_clear(cb.from_user.id)
+    await cb.message.answer("Окей, старое бронирование удалил. Начни заново через кнопку в анкете.")
+
 @rt.callback_query(F.data.startswith("pay:start:"))
 async def start_checkout(cb: CallbackQuery):
     await _touch_user(cb.from_user.id)
-    await ack(cb, "Создаю заказ…")
+    await ack(cb, "Готовлю тарифы…")
 
     try:
         gid = int(cb.data.split(":")[2])
     except Exception:
-        await cb.message.answer("Не удалось создать заказ 😕")
+        await cb.message.answer("Не удалось открыть оплату 😕")
         return
 
     mf = await get_manifest()
@@ -2957,7 +3627,7 @@ async def start_checkout(cb: CallbackQuery):
         await cb.message.answer("Не нашёл такую анкету 😭")
         return
 
-    if not wc_enabled():
+    if not checkout_enabled():
         await cb.message.answer(
             "Оплата через бот временно недоступна.\nИспользуй бронирование на сайте 👇",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -2966,29 +3636,437 @@ async def start_checkout(cb: CallbackQuery):
         )
         return
 
-    order_id, pay_url = await wc_create_order_for_girl(cb.from_user, g)
-    if not pay_url:
+    product_id = int(
+        g.get("wc_product_id")
+        or g.get("product_id")
+        or g.get("id")
+        or WC_DEFAULT_PRODUCT_ID
+        or 0
+    )
+    if product_id <= 0:
         await cb.message.answer(
-            "Не получилось создать оплату автоматически 😕\n"
-            "Можно оформить прямо на сайте:",
+            "Для этой анкеты не настроен checkout в Woo.\nОформи, пожалуйста, через сайт 👇",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [link_button("⚡ Открыть анкету", g.get("url") or SHOP_URL)],
-                [InlineKeyboardButton(text="📲 Поддержка", callback_data="support")]
             ])
         )
         return
 
-    txt = (
-        f"✅ Заказ создан{f' (#{order_id})' if order_id else ''}\n"
-        f"Девушка: <b>{html.escape(str(g.get('name', '')))}</b>\n"
-        "Нажми кнопку ниже, чтобы перейти к оплате."
-    )
+    config, err = await checkout_product_config(product_id)
+    if err or not config:
+        debug_msg = (
+            f"checkout product-config failed: girl_id={gid} "
+            f"product_id={product_id} err={err or 'empty config'}"
+        )
+        log.warning(debug_msg)
+        if ADMIN_CHAT_ID:
+            with suppress(Exception):
+                await bot.send_message(ADMIN_CHAT_ID, "⚠️ " + html.escape(debug_msg))
+        await cb.message.answer("Не удалось загрузить тарифы. Попробуй ещё раз через минуту 🙏")
+        return
+
+    plans = config.get("plans") or []
+    worker_id = int(config.get("worker_id") or 0)
+    if worker_id <= 0 or not plans:
+        await cb.message.answer("Для этой анкеты пока не настроены тарифы/календарь 😕")
+        return
+
+    calendar, err = await checkout_slots(worker_id, days=30)
+    if err:
+        await cb.message.answer("Не удалось загрузить календарь слотов. Попробуй позже 🙏")
+        return
+
+    state = {
+        "gid": gid,
+        "girl_name": str(g.get("name", "E-Girl")),
+        "product_id": product_id,
+        "worker_id": worker_id,
+        "currency": str(config.get("currency") or "RUB"),
+        "plans": plans,
+        "calendar": calendar or [],
+        "plan_idx": 0,
+        "hours": 1,
+        "selected_addons": [],
+        "date_slots": {},
+        "selected_date": "",
+        "stage": "plans",
+    }
+    await checkout_state_set(cb.from_user.id, state)
+
     await cb.message.answer(
-        txt,
+        f"💳 <b>Бронирование: {html.escape(str(g.get('name', '')))}</b>\nВыбери тариф:",
+        reply_markup=kb_checkout_plans(gid, plans),
+    )
+
+def _checkout_session(uid: int, gid: int) -> Optional[Dict[str, Any]]:
+    s = CHECKOUT_STATE.get(uid)
+    if not s:
+        return None
+    if int(s.get("gid") or 0) != int(gid):
+        return None
+    return s
+
+async def _checkout_session_load(uid: int, gid: int) -> Optional[Dict[str, Any]]:
+    s = _checkout_session(uid, gid)
+    if s:
+        return s
+    restored = await checkout_state_get(uid)
+    if not isinstance(restored, dict):
+        return None
+    if int(restored.get("gid") or 0) != int(gid):
+        return None
+    return restored
+
+async def _checkout_render_dates(cb: CallbackQuery, gid: int, s: Dict[str, Any]):
+    plans = s.get("plans") or []
+    pidx = int(s.get("plan_idx") or 0)
+    if pidx < 0 or pidx >= len(plans):
+        pidx = 0
+    plan = plans[pidx]
+    hours = max(1, int(s.get("hours") or 1))
+    duration = _step_minutes_for_plan(plan) * hours
+    step = _step_minutes_for_plan(plan)
+
+    date_slots: Dict[str, List[Dict[str, str]]] = {}
+    dates: List[str] = []
+    for row in s.get("calendar") or []:
+        if not isinstance(row, dict):
+            continue
+        date_s = str(row.get("date") or "")
+        if not date_s:
+            continue
+        sessions = _build_sessions_for_date(row.get("slots") or [], date_s, duration, step)
+        if sessions:
+            date_slots[date_s] = sessions
+            dates.append(date_s)
+
+    s["date_slots"] = date_slots
+    s["stage"] = "dates"
+    await checkout_state_set(cb.from_user.id, s)
+    if not dates:
+        await cb.message.answer(
+            "Для выбранного тарифа/часов сейчас нет свободных слотов.\nПопробуй изменить часы или тариф.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад к часам", callback_data=f"pay:hoursback:{gid}")],
+                [InlineKeyboardButton(text="🏠 В меню", callback_data="home")],
+            ]),
+        )
+        return
+
+    await cb.message.answer(
+        "🗓 Выбери дату:",
+        reply_markup=kb_checkout_dates(gid, dates),
+    )
+
+@rt.callback_query(F.data.startswith("pay:plans:"))
+async def pay_plans(cb: CallbackQuery):
+    await _touch_user(cb.from_user.id)
+    await ack(cb)
+    try:
+        gid = int(cb.data.split(":")[2])
+    except Exception:
+        return
+    s = await _checkout_session_load(cb.from_user.id, gid)
+    if not s:
+        await cb.message.answer("Сессия выбора истекла. Нажми «Забронировать» ещё раз.")
+        return
+    s["stage"] = "plans"
+    await checkout_state_set(cb.from_user.id, s)
+    await cb.message.answer("Выбери тариф:", reply_markup=kb_checkout_plans(gid, s.get("plans") or []))
+
+@rt.callback_query(F.data.startswith("pay:plan:"))
+async def pay_plan(cb: CallbackQuery):
+    await _touch_user(cb.from_user.id)
+    await ack(cb)
+    try:
+        _, _, gid_s, idx_s = cb.data.split(":", 3)
+        gid = int(gid_s)
+        idx = int(idx_s)
+    except Exception:
+        return
+    s = await _checkout_session_load(cb.from_user.id, gid)
+    if not s:
+        await cb.message.answer("Сессия выбора истекла. Нажми «Забронировать» ещё раз.")
+        return
+    plans = s.get("plans") or []
+    if idx < 0 or idx >= len(plans):
+        return
+    s["plan_idx"] = idx
+    s["hours"] = 1
+    s["selected_addons"] = []
+    s["stage"] = "hours"
+    await checkout_state_set(cb.from_user.id, s)
+    opts = plans[idx].get("hours_options") or [1, 2, 3, 4, 5]
+    plan = plans[idx]
+    plan_name = html.escape(str(plan.get("name") or ""))
+    plan_features = _plan_features_text(plan)
+    plan_addons = _plan_addons_text(plan)
+    feature_block = f"\n\n{html.escape(plan_features)}" if plan_features else ""
+    await cb.message.answer(
+        f"⏱ Тариф: <b>{plan_name}</b>{feature_block}\n\n🧩 Доп. услуги:\n{html.escape(plan_addons)}\n\nВыбери количество часов:",
+        reply_markup=kb_checkout_hours(gid, opts),
+    )
+
+@rt.callback_query(F.data.startswith("pay:hours:"))
+async def pay_hours(cb: CallbackQuery):
+    await _touch_user(cb.from_user.id)
+    await ack(cb)
+    try:
+        _, _, gid_s, h_s = cb.data.split(":", 3)
+        gid = int(gid_s)
+        hours = int(h_s)
+    except Exception:
+        return
+    s = await _checkout_session_load(cb.from_user.id, gid)
+    if not s:
+        await cb.message.answer("Сессия выбора истекла. Нажми «Забронировать» ещё раз.")
+        return
+    plans = s.get("plans") or []
+    pidx = int(s.get("plan_idx") or 0)
+    if pidx < 0 or pidx >= len(plans):
+        return
+    s["hours"] = max(1, min(12, hours))
+    s["selected_addons"] = []
+    s["stage"] = "addons"
+    await checkout_state_set(cb.from_user.id, s)
+    plan = plans[pidx]
+    price, _ = _checkout_price(plan, int(s["hours"]), [])
+    plan_addons = _plan_addons_text(plan)
+    await cb.message.answer(
+        f"🧩 Часы: <b>{s['hours']}</b>\nБаза: <b>{money(price, s.get('currency'))}</b>\n\nДоп. услуги тарифа:\n{html.escape(plan_addons)}\n\nВыбери доп. опции:",
+        reply_markup=kb_checkout_addons(gid, plan, s.get("selected_addons") or []),
+    )
+
+@rt.callback_query(F.data.startswith("pay:hoursback:"))
+async def pay_hours_back(cb: CallbackQuery):
+    await _touch_user(cb.from_user.id)
+    await ack(cb)
+    try:
+        gid = int(cb.data.split(":")[2])
+    except Exception:
+        return
+    s = await _checkout_session_load(cb.from_user.id, gid)
+    if not s:
+        return
+    plans = s.get("plans") or []
+    pidx = int(s.get("plan_idx") or 0)
+    if pidx < 0 or pidx >= len(plans):
+        return
+    s["stage"] = "hours"
+    await checkout_state_set(cb.from_user.id, s)
+    opts = plans[pidx].get("hours_options") or [1, 2, 3, 4, 5]
+    await cb.message.answer("Выбери количество часов:", reply_markup=kb_checkout_hours(gid, opts))
+
+@rt.callback_query(F.data.startswith("pay:addon:"))
+async def pay_addon_toggle(cb: CallbackQuery):
+    await _touch_user(cb.from_user.id)
+    await ack(cb)
+    try:
+        _, _, gid_s, idx_s = cb.data.split(":", 3)
+        gid = int(gid_s)
+        aidx = int(idx_s)
+    except Exception:
+        return
+    s = await _checkout_session_load(cb.from_user.id, gid)
+    if not s:
+        return
+    plans = s.get("plans") or []
+    pidx = int(s.get("plan_idx") or 0)
+    if pidx < 0 or pidx >= len(plans):
+        return
+    plan = plans[pidx]
+    addons = plan.get("addons") or []
+    if aidx < 0 or aidx >= len(addons):
+        return
+    aid = str(addons[aidx].get("id") or "")
+    if not aid:
+        return
+    selected = set(s.get("selected_addons") or [])
+    if aid in selected:
+        selected.remove(aid)
+    else:
+        selected.add(aid)
+    s["selected_addons"] = list(selected)
+    s["stage"] = "addons"
+    await checkout_state_set(cb.from_user.id, s)
+    total, _ = _checkout_price(plan, int(s.get("hours") or 1), s["selected_addons"])
+    plan_addons = _plan_addons_text(plan)
+    await cb.message.answer(
+        f"Текущая сумма: <b>{money(total, s.get('currency'))}</b>\n\nДоп. услуги тарифа:\n{html.escape(plan_addons)}\n\nВыбери доп. опции:",
+        reply_markup=kb_checkout_addons(gid, plan, s["selected_addons"]),
+    )
+
+@rt.callback_query(F.data.startswith("pay:addons:"))
+async def pay_addons_back(cb: CallbackQuery):
+    await _touch_user(cb.from_user.id)
+    await ack(cb)
+    try:
+        gid = int(cb.data.split(":")[2])
+    except Exception:
+        return
+    s = await _checkout_session_load(cb.from_user.id, gid)
+    if not s:
+        return
+    plans = s.get("plans") or []
+    pidx = int(s.get("plan_idx") or 0)
+    if pidx < 0 or pidx >= len(plans):
+        return
+    plan = plans[pidx]
+    s["stage"] = "addons"
+    await checkout_state_set(cb.from_user.id, s)
+    plan_addons = _plan_addons_text(plan)
+    await cb.message.answer(
+        f"Доп. услуги тарифа:\n{html.escape(plan_addons)}\n\nВыбери доп. опции:",
+        reply_markup=kb_checkout_addons(gid, plan, s.get("selected_addons") or []),
+    )
+
+@rt.callback_query(F.data.startswith("pay:addondone:"))
+async def pay_addon_done(cb: CallbackQuery):
+    await _touch_user(cb.from_user.id)
+    await ack(cb, "Готовлю даты…")
+    try:
+        gid = int(cb.data.split(":")[2])
+    except Exception:
+        return
+    s = await _checkout_session_load(cb.from_user.id, gid)
+    if not s:
+        return
+    await _checkout_render_dates(cb, gid, s)
+
+@rt.callback_query(F.data.startswith("pay:dates:"))
+async def pay_dates_back(cb: CallbackQuery):
+    await _touch_user(cb.from_user.id)
+    await ack(cb)
+    try:
+        gid = int(cb.data.split(":")[2])
+    except Exception:
+        return
+    s = await _checkout_session_load(cb.from_user.id, gid)
+    if not s:
+        return
+    await _checkout_render_dates(cb, gid, s)
+
+@rt.callback_query(F.data.startswith("pay:date:"))
+async def pay_pick_date(cb: CallbackQuery):
+    await _touch_user(cb.from_user.id)
+    await ack(cb)
+    try:
+        _, _, gid_s, dkey = cb.data.split(":", 3)
+        gid = int(gid_s)
+        if len(dkey) != 8:
+            return
+        date_s = f"{dkey[0:4]}-{dkey[4:6]}-{dkey[6:8]}"
+    except Exception:
+        return
+    s = await _checkout_session_load(cb.from_user.id, gid)
+    if not s:
+        return
+    slots = (s.get("date_slots") or {}).get(date_s) or []
+    if not slots:
+        await cb.message.answer("Для этой даты нет свободных слотов. Выбери другую дату.")
+        await _checkout_render_dates(cb, gid, s)
+        return
+    s["selected_date"] = date_s
+    s["stage"] = "slots"
+    await checkout_state_set(cb.from_user.id, s)
+    await cb.message.answer(
+        f"🕒 Выбери слот на <b>{_date_ru(date_s)}</b>:",
+        reply_markup=kb_checkout_slots(gid, date_s, slots),
+    )
+
+@rt.callback_query(F.data.startswith("pay:slot:"))
+async def pay_pick_slot(cb: CallbackQuery):
+    await _touch_user(cb.from_user.id)
+    await ack(cb, "Удерживаю слот и создаю заказ…")
+    try:
+        _, _, gid_s, idx_s = cb.data.split(":", 3)
+        gid = int(gid_s)
+        sidx = int(idx_s)
+    except Exception:
+        return
+
+    s = await _checkout_session_load(cb.from_user.id, gid)
+    if not s:
+        await cb.message.answer("Сессия выбора истекла. Нажми «Забронировать» ещё раз.")
+        return
+
+    date_s = str(s.get("selected_date") or "")
+    slots = (s.get("date_slots") or {}).get(date_s) or []
+    if sidx < 0 or sidx >= len(slots):
+        await cb.message.answer("Слот устарел, выбери снова.")
+        return
+
+    slot = slots[sidx]
+    hold_token, err = await checkout_hold(
+        int(s.get("worker_id") or 0),
+        str(slot.get("date") or ""),
+        str(slot.get("start") or ""),
+        str(slot.get("end") or ""),
+    )
+    if err or not hold_token:
+        await cb.message.answer("Этот слот уже заняли. Выбери другой 🙏")
+        await _checkout_render_dates(cb, gid, s)
+        return
+
+    mf = await get_manifest()
+    g = girl_by_id(mf, gid)
+    if not g:
+        await cb.message.answer("Анкета больше недоступна 😕")
+        return
+
+    plans = s.get("plans") or []
+    pidx = int(s.get("plan_idx") or 0)
+    if pidx < 0 or pidx >= len(plans):
+        await cb.message.answer("Сессия выбора истекла. Начни заново.")
+        return
+    plan = plans[pidx]
+    hours = int(s.get("hours") or 1)
+    selected_addons = s.get("selected_addons") or []
+    price, addon_labels = _checkout_price(plan, hours, selected_addons)
+
+    checkout_payload = {
+        "price": price,
+        "currency": s.get("currency") or "RUB",
+        "product_id": int(s.get("product_id") or 0),
+        "plan_name": str(plan.get("name") or ""),
+        "hours": str(hours),
+        "addons_text": ", ".join(addon_labels),
+        "date": str(slot.get("date") or ""),
+        "start": str(slot.get("start") or ""),
+        "end": str(slot.get("end") or ""),
+        "worker_id": int(s.get("worker_id") or 0),
+        "hold_token": hold_token,
+    }
+
+    order_id, pay_url = await wc_create_order_for_girl(cb.from_user, g, checkout=checkout_payload)
+    if not pay_url:
+        await cb.message.answer("Не получилось создать оплату. Попробуй ещё раз через минуту 🙏")
+        return
+
+    if order_id:
+        await db_checkout_order_upsert(
+            order_id=int(order_id),
+            chat_id=cb.from_user.id,
+            girl_id=int(gid),
+            girl_name=str(s.get("girl_name") or g.get("name") or ""),
+            amount=float(price),
+            currency=str(s.get("currency") or "RUB"),
+        )
+    await checkout_state_clear(cb.from_user.id)
+    addon_line = ", ".join(addon_labels) if addon_labels else "—"
+    await cb.message.answer(
+        "✅ <b>Заказ создан</b>\n"
+        f"{f'Номер: <code>#{order_id}</code>\\n' if order_id else ''}"
+        f"Девушка: <b>{html.escape(str(s.get('girl_name') or g.get('name') or ''))}</b>\n"
+        f"План: <b>{html.escape(str(plan.get('name') or ''))}</b>\n"
+        f"Часы: <b>{hours}</b>\n"
+        f"Допы: <b>{html.escape(addon_line)}</b>\n"
+        f"Слот: <b>{html.escape(str(slot.get('date')))} {html.escape(str(slot.get('start')))}-{html.escape(str(slot.get('end')))}</b>\n"
+        f"Сумма: <b>{money(price, s.get('currency'))}</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [link_button("💳 Оплатить заказ", pay_url)],
-            [InlineKeyboardButton(text="🏠 В меню", callback_data="home")]
-        ])
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="home")],
+        ]),
     )
 
 @rt.callback_query(F.data == "noop")
@@ -3356,11 +4434,17 @@ async def vip_buy(cb: CallbackQuery):
         )
         return
 
-    redirect_url, tx_id, status = await platega_create_vip_payment(cb.from_user)
+    flash = await db_get_vip_flash_offer(cb.from_user.id)
+    discount_pct = int((flash or {}).get("discount_pct") or 0)
+    vip_amount = float(VIP_PRICE)
+    if discount_pct > 0:
+        vip_amount = round(vip_amount * (100.0 - min(95, discount_pct)) / 100.0, 2)
+
+    redirect_url, tx_id, status = await platega_create_vip_payment(cb.from_user, amount=vip_amount)
     await db_add_vip_payment(
         chat_id=cb.from_user.id,
         transaction_id=tx_id,
-        amount=VIP_PRICE,
+        amount=vip_amount,
         currency=VIP_CURRENCY,
         status=status,
         redirect_url=redirect_url
@@ -3376,10 +4460,14 @@ async def vip_buy(cb: CallbackQuery):
         )
         return
 
+    if flash:
+        await db_mark_vip_flash_offer_used(cb.from_user.id)
+
     text = (
         "✅ <b>VIP заявка создана</b>\n"
-        f"Сумма: <b>{int(VIP_PRICE)} {html.escape(VIP_CURRENCY)}</b>\n"
-        "Оплати по ссылке ниже (СБП QR)."
+        f"Сумма: <b>{money(vip_amount, VIP_CURRENCY)}</b>\n"
+        + (f"Скидка: <b>{discount_pct}%</b>\n" if discount_pct > 0 else "")
+        + "Оплати по ссылке ниже (СБП QR)."
     )
     await cb.message.answer(
         text,
@@ -3444,6 +4532,86 @@ async def sub_reward_flow(cb: CallbackQuery):
             ])
         )
         return
+
+async def send_post_purchase_sequence(order: Dict[str, Any]):
+    chat_id = int(order.get("chat_id") or 0)
+    if chat_id <= 0:
+        return
+    girl_id = int(order.get("girl_id") or 0)
+    girl_name = str(order.get("girl_name") or "выбранной анкете")
+    amount = float(order.get("amount") or 0.0)
+    currency = str(order.get("currency") or "RUB")
+    order_id = int(order.get("order_id") or 0)
+    vip_discount = max(1, int(POST_PURCHASE_VIP_DISCOUNT_PCT))
+    vip_hours = max(1, int(POST_PURCHASE_VIP_WINDOW_HOURS))
+    await db_set_vip_flash_offer(chat_id, vip_discount, vip_hours)
+
+    await bot.send_message(
+        chat_id,
+        "🎉 <b>Спасибо за оплату!</b>\n"
+        f"Заказ <code>#{order_id}</code> подтверждён.\n"
+        f"Сумма: <b>{money(amount, currency)}</b>\n"
+        f"Анкета: <b>{html.escape(girl_name)}</b>",
+    )
+
+    fav_rows: List[List[InlineKeyboardButton]] = []
+    if girl_id > 0:
+        fav_rows.append([InlineKeyboardButton(text="❤️ Добавить в избранное", callback_data=f"fav:add:{girl_id}")])
+    if SUBSCRIBE_CHANNEL_URL:
+        fav_rows.append([InlineKeyboardButton(text="📲 Закрытый канал", callback_data="sub:start")])
+    if fav_rows:
+        await bot.send_message(
+            chat_id,
+            "🔥 Чтобы не потерять контакт и слоты, добавь анкету в избранное и подпишись на канал.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=fav_rows),
+        )
+
+    vip_text = (
+        f"👑 <b>Спец-оффер после оплаты</b>\n"
+        f"VIP со скидкой <b>{vip_discount}%</b> на {vip_hours}ч.\n"
+        f"Промокод: <code>{html.escape(POST_PURCHASE_VIP_CODE)}</code>"
+    )
+    await bot.send_message(
+        chat_id,
+        vip_text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👑 Забрать VIP-оффер", callback_data="vip:buy")],
+            [InlineKeyboardButton(text="📲 Уточнить у поддержки", callback_data="support")],
+        ]),
+    )
+
+async def checkout_post_purchase_watcher():
+    paid_statuses = {"processing", "completed"}
+    while True:
+        try:
+            orders = await db_checkout_orders_pending(limit=40)
+            for order in orders:
+                order_id = int(order.get("order_id") or 0)
+                if order_id <= 0:
+                    continue
+
+                status, err = await wc_get_order_status(order_id)
+                if err:
+                    log.warning("post-purchase status check failed: order_id=%s err=%s", order_id, err)
+                    continue
+                if not status:
+                    continue
+
+                is_paid = status in paid_statuses
+                if not is_paid:
+                    await db_checkout_order_status(order_id, status=status, paid=False, mark_post_purchase_sent=False)
+                    continue
+
+                try:
+                    await send_post_purchase_sequence(order)
+                    await db_checkout_order_status(order_id, status=status, paid=True, mark_post_purchase_sent=True)
+                except Exception as e:
+                    log.warning("post-purchase send failed: order_id=%s err=%s", order_id, e)
+                    await db_checkout_order_status(order_id, status=status, paid=True, mark_post_purchase_sent=False)
+        except Exception as e:
+            log.warning("checkout_post_purchase_watcher loop failed: %s", e)
+
+        await asyncio.sleep(max(15, POST_PURCHASE_POLL_SEC))
 
 async def slot_subscriptions_watcher():
     while True:
@@ -3639,6 +4807,7 @@ async def support_start(cb: CallbackQuery):
         return
     await ack(cb, "Жду твоё сообщение 👇")
     PENDING_SUPPORT[cb.from_user.id] = True
+    await db_set_pending_action(cb.from_user.id, "support")
     await cb.message.answer(
         "Опиши проблему одним сообщением (можно текст/фото/видео/войс/док). "
         "Чтобы отменить — напиши /cancel."
@@ -3663,7 +4832,9 @@ async def inbox_private(msg: Message):
 
     uid = msg.from_user.id
 
-    if PENDING_SUPPORT.pop(uid, None):
+    pending_action = await db_get_pending_action(uid)
+    support_pending = bool(PENDING_SUPPORT.get(uid)) or pending_action == "support"
+    if support_pending:
         if not ADMIN_CHAT_ID:
             await msg.reply("Поддержка временно недоступна 😕")
             return
@@ -3676,16 +4847,40 @@ async def inbox_private(msg: Message):
         )
         with suppress(Exception):
             await bot.send_message(ADMIN_CHAT_ID, header, disable_web_page_preview=True)
-        forwarded = True
+        delivered = False
         try:
-            await bot.forward_message(ADMIN_CHAT_ID, msg.chat.id, msg.message_id)
+            await bot.copy_message(ADMIN_CHAT_ID, msg.chat.id, msg.message_id)
+            delivered = True
         except Exception as e:
             log.warning("support forward failed: %s", e)
-            forwarded = False
-        if not forwarded and msg.text:
-            with suppress(Exception):
-                await bot.send_message(ADMIN_CHAT_ID, "Текст обращения:\n\n" + html.escape(msg.text))
-        await msg.reply("Готово! Мы получили твоё обращение — служба поддержки свяжется с тобой. 🙌")
+        if not delivered:
+            fallback_text = None
+            if msg.text:
+                fallback_text = "Текст обращения:\n\n" + html.escape(msg.text)
+            else:
+                fallback_text = (
+                    "Обращение в поддержку не удалось переслать как медиа.\n"
+                    f"Пользователь: <code>{uid}</code>\n"
+                    f"Тип сообщения: <code>{html.escape(msg.content_type or 'unknown')}</code>"
+                )
+            try:
+                await bot.send_message(ADMIN_CHAT_ID, fallback_text, disable_web_page_preview=True)
+                delivered = True
+            except Exception as e:
+                log.warning("support fallback delivery failed: %s", e)
+                delivered = False
+
+        if delivered:
+            PENDING_SUPPORT.pop(uid, None)
+            await db_clear_pending_action(uid)
+            await msg.reply("Готово! Мы получили твоё обращение — служба поддержки свяжется с тобой. 🙌")
+        else:
+            PENDING_SUPPORT[uid] = True
+            await db_set_pending_action(uid, "support")
+            await msg.reply(
+                "Не удалось отправить обращение в поддержку прямо сейчас 😕\n"
+                "Попробуй ещё раз через минуту или напиши /cancel."
+            )
         return
 
     gid = PENDING_SUGGEST.get(uid)
@@ -3727,6 +4922,7 @@ async def inbox_private(msg: Message):
 async def main():
     db_init()
     await seed_campaigns_if_empty()
+    asyncio.create_task(checkout_post_purchase_watcher())
     asyncio.create_task(slot_subscriptions_watcher())
     if SLOT_NEWS_CHAT_ID:
         asyncio.create_task(slot_channel_news_watcher())
