@@ -2,7 +2,8 @@
 # E-GIRLZ Telegram Bot — full version with robust logging
 # Aiogram v3
 
-import os, json, base64, logging, time, html, re, aiohttp, sqlite3, asyncio, tempfile, csv, traceback
+import os, json, base64, logging, time, html, re, aiohttp, sqlite3, asyncio, tempfile, csv, traceback, ssl
+from datetime import datetime, timedelta
 from urllib.parse import quote_plus
 from typing import Any, Dict, List, Optional, Tuple
 from contextlib import suppress
@@ -10,7 +11,7 @@ from contextlib import suppress
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    InputMediaPhoto, FSInputFile
+    InputMediaPhoto, FSInputFile, WebAppInfo
 )
 from aiogram.filters import CommandStart, CommandObject, Command
 from aiogram.enums import ParseMode
@@ -19,6 +20,10 @@ from aiogram.exceptions import TelegramBadRequest
 from dotenv import load_dotenv
 
 import random
+try:
+    import certifi
+except Exception:
+    certifi = None
 
 # ─── ENV ──────────────────────────────────────────────────────────────────────
 load_dotenv(override=True)
@@ -35,6 +40,24 @@ SHOP_URL    = os.getenv("SHOP_URL", "https://egirlz.chat")
 COUPON_CODE = os.getenv("COUPON_CODE", "LEAVE10")
 GIRLS_MANIFEST_URL = os.getenv("GIRLS_MANIFEST_URL")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or 0)
+SLOT_NEWS_CHAT_ID = int(os.getenv("SLOT_NEWS_CHAT_ID", "0") or 0)
+SUBSCRIBE_CHANNEL_ID = os.getenv("SUBSCRIBE_CHANNEL_ID", "").strip()
+SUBSCRIBE_CHANNEL_URL = os.getenv("SUBSCRIBE_CHANNEL_URL", "").strip()
+SUBSCRIBE_COUPON = (os.getenv("SUBSCRIBE_COUPON", "WELCOME20") or "WELCOME20").strip()
+WC_API_URL = os.getenv("WC_API_URL", "").strip()  # e.g. https://site.com/wp-json/wc/v3
+WC_CONSUMER_KEY = os.getenv("WC_CONSUMER_KEY", "").strip()
+WC_CONSUMER_SECRET = os.getenv("WC_CONSUMER_SECRET", "").strip()
+WC_DEFAULT_PRODUCT_ID = int(os.getenv("WC_DEFAULT_PRODUCT_ID", "0") or 0)
+WC_FORCE_FEE_ONLY = str(os.getenv("WC_FORCE_FEE_ONLY", "0")).strip().lower() in {"1", "true", "yes", "on"}
+TG_OPEN_URLS_AS_WEBAPP = str(os.getenv("TG_OPEN_URLS_AS_WEBAPP", "1")).strip().lower() in {"1", "true", "yes", "on"}
+PLATEGA_BASE_URL = (os.getenv("PLATEGA_BASE_URL", "https://app.platega.io") or "https://app.platega.io").strip().rstrip("/")
+PLATEGA_MERCHANT_ID = os.getenv("PLATEGA_MERCHANT_ID", "").strip()
+PLATEGA_SECRET = os.getenv("PLATEGA_SECRET", "").strip()
+VIP_PRICE = float(os.getenv("VIP_PRICE", "990") or 990)
+VIP_CURRENCY = (os.getenv("VIP_CURRENCY", "RUB") or "RUB").strip().upper()
+VIP_PAYMENT_METHOD = int(os.getenv("VIP_PAYMENT_METHOD", "2") or 2)  # 2 = SBP QR
+VIP_RETURN_URL = (os.getenv("VIP_RETURN_URL", f"{SHOP_URL.rstrip('/')}/vip-success") or f"{SHOP_URL.rstrip('/')}/vip-success").strip()
+VIP_FAILED_URL = (os.getenv("VIP_FAILED_URL", f"{SHOP_URL.rstrip('/')}/vip-fail") or f"{SHOP_URL.rstrip('/')}/vip-fail").strip()
 DB_PATH = os.getenv("DB_PATH", "egirlz_bot.db")  # SQLite файл
 
 COUPON_20 = (os.getenv("COUPON_20", "TODAY20") or "TODAY20").strip()
@@ -98,6 +121,69 @@ def db_init():
         )
     """)
     con.execute("CREATE INDEX IF NOT EXISTS idx_interests_cg ON interests(chat_id, girl_id, created_at)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_interests_chat ON interests(chat_id, created_at)")
+
+    # favorites
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS favorites (
+            chat_id    INTEGER NOT NULL,
+            girl_id    INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY(chat_id, girl_id)
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_favorites_chat ON favorites(chat_id, created_at)")
+    # slot subscriptions
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS slot_subscriptions (
+            chat_id         INTEGER NOT NULL,
+            girl_id         INTEGER NOT NULL,
+            known_slots     TEXT NOT NULL DEFAULT '[]',
+            created_at      INTEGER NOT NULL,
+            last_notified_at INTEGER,
+            PRIMARY KEY(chat_id, girl_id)
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_slot_subs_chat ON slot_subscriptions(chat_id, created_at)")
+    # per-girl channel state for "new slots" autopost
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS slot_channel_state (
+            girl_id        INTEGER PRIMARY KEY,
+            known_slots    TEXT NOT NULL DEFAULT '[]',
+            last_posted_at INTEGER
+        )
+    """)
+    # recommendation push log (anti-spam)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS reco_push_log (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id    INTEGER NOT NULL,
+            created_at INTEGER NOT NULL
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_reco_push_chat ON reco_push_log(chat_id, created_at)")
+    # one-time reward for channel subscription
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS subscribe_rewards (
+            chat_id     INTEGER PRIMARY KEY,
+            coupon      TEXT,
+            created_at  INTEGER NOT NULL
+        )
+    """)
+    # VIP payments created via Platega
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS vip_payments (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id         INTEGER NOT NULL,
+            transaction_id  TEXT,
+            amount          REAL NOT NULL,
+            currency        TEXT NOT NULL,
+            status          TEXT,
+            redirect_url    TEXT,
+            created_at      INTEGER NOT NULL
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_vip_payments_chat ON vip_payments(chat_id, created_at)")
 
     # campaign log
     con.execute("""
@@ -514,11 +600,434 @@ async def db_users_list(limit: int = 50) -> List[Dict[str,Any]]:
         return rows
     return await asyncio.to_thread(_op)
 
+async def db_favorite_add(chat_id: int, girl_id: int):
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        con.execute(
+            "INSERT OR IGNORE INTO favorites(chat_id, girl_id, created_at) VALUES (?,?,?)",
+            (chat_id, girl_id, int(time.time()))
+        )
+        con.commit()
+        con.close()
+    await asyncio.to_thread(_op)
+
+async def db_favorite_remove(chat_id: int, girl_id: int):
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        con.execute("DELETE FROM favorites WHERE chat_id=? AND girl_id=?", (chat_id, girl_id))
+        con.commit()
+        con.close()
+    await asyncio.to_thread(_op)
+
+async def db_favorite_exists(chat_id: int, girl_id: int) -> bool:
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        try:
+            cur = con.execute("SELECT 1 FROM favorites WHERE chat_id=? AND girl_id=? LIMIT 1", (chat_id, girl_id))
+            return cur.fetchone() is not None
+        finally:
+            con.close()
+    return await asyncio.to_thread(_op)
+
+async def db_favorites_list(chat_id: int) -> List[int]:
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        try:
+            cur = con.execute(
+                "SELECT girl_id FROM favorites WHERE chat_id=? ORDER BY created_at DESC",
+                (chat_id,)
+            )
+            return [int(r[0]) for r in cur.fetchall()]
+        finally:
+            con.close()
+    return await asyncio.to_thread(_op)
+
+async def db_user_last_seen(chat_id: int) -> Optional[int]:
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        try:
+            cur = con.execute("SELECT last_seen FROM users WHERE chat_id=?", (chat_id,))
+            row = cur.fetchone()
+            if not row or row[0] is None:
+                return None
+            return int(row[0])
+        finally:
+            con.close()
+    return await asyncio.to_thread(_op)
+
+async def db_slot_subscribe(chat_id: int, girl_id: int, known_slots: List[str]):
+    payload = json.dumps(known_slots, ensure_ascii=False)
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        con.execute(
+            """
+            INSERT INTO slot_subscriptions(chat_id, girl_id, known_slots, created_at, last_notified_at)
+            VALUES (?,?,?,?,NULL)
+            ON CONFLICT(chat_id, girl_id) DO UPDATE SET
+                known_slots=excluded.known_slots
+            """,
+            (chat_id, girl_id, payload, int(time.time()))
+        )
+        con.commit()
+        con.close()
+    await asyncio.to_thread(_op)
+
+async def db_slot_unsubscribe(chat_id: int, girl_id: int):
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        con.execute("DELETE FROM slot_subscriptions WHERE chat_id=? AND girl_id=?", (chat_id, girl_id))
+        con.commit()
+        con.close()
+    await asyncio.to_thread(_op)
+
+async def db_slot_sub_exists(chat_id: int, girl_id: int) -> bool:
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        try:
+            cur = con.execute(
+                "SELECT 1 FROM slot_subscriptions WHERE chat_id=? AND girl_id=? LIMIT 1",
+                (chat_id, girl_id)
+            )
+            return cur.fetchone() is not None
+        finally:
+            con.close()
+    return await asyncio.to_thread(_op)
+
+async def db_slot_subscriptions() -> List[Dict[str, Any]]:
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        try:
+            cur = con.execute(
+                "SELECT chat_id, girl_id, known_slots FROM slot_subscriptions"
+            )
+            rows = []
+            for chat_id, girl_id, known_slots in cur.fetchall():
+                rows.append({
+                    "chat_id": int(chat_id),
+                    "girl_id": int(girl_id),
+                    "known_slots": str(known_slots or "[]")
+                })
+            return rows
+        finally:
+            con.close()
+    return await asyncio.to_thread(_op)
+
+async def db_slot_sub_update_known(chat_id: int, girl_id: int, known_slots: List[str], touched_notify: bool):
+    payload = json.dumps(known_slots, ensure_ascii=False)
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        if touched_notify:
+            con.execute(
+                "UPDATE slot_subscriptions SET known_slots=?, last_notified_at=? WHERE chat_id=? AND girl_id=?",
+                (payload, int(time.time()), chat_id, girl_id)
+            )
+        else:
+            con.execute(
+                "UPDATE slot_subscriptions SET known_slots=? WHERE chat_id=? AND girl_id=?",
+                (payload, chat_id, girl_id)
+            )
+        con.commit()
+        con.close()
+    await asyncio.to_thread(_op)
+
+async def db_recent_interest_girl_ids(chat_id: int, limit: int = 20, within_sec: int = 7 * 24 * 3600) -> List[int]:
+    cutoff = int(time.time()) - int(within_sec)
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        try:
+            cur = con.execute(
+                """
+                SELECT girl_id
+                FROM interests
+                WHERE chat_id=? AND created_at>=?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (chat_id, cutoff, int(limit))
+            )
+            out: List[int] = []
+            for (gid,) in cur.fetchall():
+                try:
+                    out.append(int(gid))
+                except Exception:
+                    pass
+            return out
+        finally:
+            con.close()
+    return await asyncio.to_thread(_op)
+
+async def db_recent_reco_sent(chat_id: int, within_sec: int = 6 * 3600) -> bool:
+    cutoff = int(time.time()) - int(within_sec)
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        try:
+            cur = con.execute(
+                "SELECT 1 FROM reco_push_log WHERE chat_id=? AND created_at>=? LIMIT 1",
+                (chat_id, cutoff)
+            )
+            return cur.fetchone() is not None
+        finally:
+            con.close()
+    return await asyncio.to_thread(_op)
+
+async def db_mark_reco_sent(chat_id: int):
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        con.execute(
+            "INSERT INTO reco_push_log(chat_id, created_at) VALUES (?,?)",
+            (chat_id, int(time.time()))
+        )
+        con.commit()
+        con.close()
+    await asyncio.to_thread(_op)
+
+async def db_channel_state_get(girl_id: int) -> Optional[List[str]]:
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        try:
+            cur = con.execute("SELECT known_slots FROM slot_channel_state WHERE girl_id=?", (girl_id,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            try:
+                data = json.loads(row[0] or "[]")
+                if isinstance(data, list):
+                    return [str(x) for x in data]
+                return []
+            except Exception:
+                return []
+        finally:
+            con.close()
+    return await asyncio.to_thread(_op)
+
+async def db_channel_state_set(girl_id: int, known_slots: List[str], posted_now: bool = False):
+    payload = json.dumps(known_slots, ensure_ascii=False)
+    ts = int(time.time()) if posted_now else None
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        if ts is None:
+            con.execute(
+                """
+                INSERT INTO slot_channel_state(girl_id, known_slots, last_posted_at)
+                VALUES (?, ?, COALESCE((SELECT last_posted_at FROM slot_channel_state WHERE girl_id=?), NULL))
+                ON CONFLICT(girl_id) DO UPDATE SET
+                    known_slots=excluded.known_slots
+                """,
+                (girl_id, payload, girl_id)
+            )
+        else:
+            con.execute(
+                """
+                INSERT INTO slot_channel_state(girl_id, known_slots, last_posted_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(girl_id) DO UPDATE SET
+                    known_slots=excluded.known_slots,
+                    last_posted_at=excluded.last_posted_at
+                """,
+                (girl_id, payload, ts)
+            )
+        con.commit()
+        con.close()
+    await asyncio.to_thread(_op)
+
+async def db_sub_reward_exists(chat_id: int) -> bool:
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        try:
+            cur = con.execute("SELECT 1 FROM subscribe_rewards WHERE chat_id=? LIMIT 1", (chat_id,))
+            return cur.fetchone() is not None
+        finally:
+            con.close()
+    return await asyncio.to_thread(_op)
+
+async def db_mark_sub_reward(chat_id: int, coupon: str):
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        con.execute(
+            "INSERT OR IGNORE INTO subscribe_rewards(chat_id, coupon, created_at) VALUES (?,?,?)",
+            (chat_id, coupon, int(time.time()))
+        )
+        con.commit()
+        con.close()
+    await asyncio.to_thread(_op)
+
+async def is_user_subscribed(user_id: int) -> bool:
+    if not SUBSCRIBE_CHANNEL_ID:
+        return False
+    try:
+        member = await bot.get_chat_member(SUBSCRIBE_CHANNEL_ID, user_id)
+        return member.status in {"member", "administrator", "creator", "restricted"}
+    except Exception as e:
+        log.warning("is_user_subscribed failed: %s", e)
+        return False
+
+def platega_enabled() -> bool:
+    return bool(PLATEGA_MERCHANT_ID and PLATEGA_SECRET)
+
+async def db_add_vip_payment(chat_id: int, transaction_id: str | None, amount: float, currency: str, status: str | None, redirect_url: str | None):
+    def _op():
+        con = sqlite3.connect(DB_PATH)
+        con.execute(
+            """
+            INSERT INTO vip_payments(chat_id, transaction_id, amount, currency, status, redirect_url, created_at)
+            VALUES (?,?,?,?,?,?,?)
+            """,
+            (chat_id, transaction_id, float(amount), currency, status, redirect_url, int(time.time()))
+        )
+        con.commit()
+        con.close()
+    await asyncio.to_thread(_op)
+
+async def platega_create_vip_payment(user) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Returns: (redirect_url, transaction_id, status)
+    """
+    if not platega_enabled():
+        return None, None, None
+
+    payload_info = {
+        "source": "telegram_bot",
+        "kind": "vip_subscription",
+        "tg_user_id": str(user.id),
+        "tg_username": str(getattr(user, "username", "") or ""),
+    }
+    body = {
+        "paymentMethod": VIP_PAYMENT_METHOD,
+        "paymentDetails": {
+            "amount": float(VIP_PRICE),
+            "currency": VIP_CURRENCY
+        },
+        "description": f"VIP подписка EGIRLZ для Telegram user {user.id}",
+        "return": VIP_RETURN_URL,
+        "failedUrl": VIP_FAILED_URL,
+        "payload": json.dumps(payload_info, ensure_ascii=False),
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-MerchantId": PLATEGA_MERCHANT_ID,
+        "X-Secret": PLATEGA_SECRET,
+    }
+    url = f"{PLATEGA_BASE_URL}/transaction/process"
+    try:
+        async with aiohttp.ClientSession(connector=build_http_connector()) as s:
+            async with s.post(url, json=body, headers=headers, timeout=25) as r:
+                txt = await r.text()
+                if r.status >= 400:
+                    log.warning("Platega create failed status=%s body=%s", r.status, txt[:1000])
+                    return None, None, None
+                data = json.loads(txt)
+    except Exception as e:
+        log.warning("Platega create exception: %s", e)
+        return None, None, None
+
+    redirect = data.get("redirect")
+    transaction_id = data.get("transactionId")
+    status = data.get("status")
+    return (str(redirect) if redirect else None, str(transaction_id) if transaction_id else None, str(status) if status else None)
+
+def slot_key_to_human(key: str) -> str:
+    try:
+        date_s, start, end = key.split("|", 2)
+        day = datetime.strptime(date_s, "%Y-%m-%d").strftime("%d.%m")
+        return f"{day} {start} - {end}"
+    except Exception:
+        return key
+
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
 def apply_link(coupon: str | None = None) -> str:
     base = SHOP_URL.rstrip("/")
     code = (coupon or COUPON_CODE).strip()
     return f"{base}/?coupon={quote_plus(code)}"
+
+def wc_enabled() -> bool:
+    return bool(WC_API_URL and WC_CONSUMER_KEY and WC_CONSUMER_SECRET)
+
+def wc_store_base_url() -> str:
+    if WC_API_URL and "/wp-json/" in WC_API_URL:
+        return WC_API_URL.split("/wp-json/", 1)[0].rstrip("/")
+    return SHOP_URL.rstrip("/")
+
+def _girl_checkout_price(g: Dict[str, Any]) -> float:
+    for k in ("from_price", "price"):
+        v = g.get(k)
+        if v is None:
+            continue
+        try:
+            return float(v)
+        except Exception:
+            pass
+    return 0.0
+
+async def wc_create_order_for_girl(user, g: Dict[str, Any]) -> Tuple[Optional[int], Optional[str]]:
+    """
+    Creates WooCommerce order and returns (order_id, payment_url).
+    payment_url can be None when order creation failed.
+    """
+    if not wc_enabled():
+        return None, None
+
+    price = _girl_checkout_price(g)
+    currency = str(g.get("currency") or "RUB")
+    product_id = int(g.get("wc_product_id") or WC_DEFAULT_PRODUCT_ID or 0)
+    gname = str(g.get("name", "E-Girl"))
+
+    payload: Dict[str, Any] = {
+        "status": "pending",
+        "currency": currency,
+        "set_paid": False,
+        "billing": {
+            "first_name": str(getattr(user, "first_name", "") or ""),
+            "last_name": str(getattr(user, "last_name", "") or ""),
+            "email": f"tg_{int(user.id)}@example.local",
+        },
+        "customer_note": f"Telegram order for {gname}",
+        "meta_data": [
+            {"key": "source", "value": "telegram_bot"},
+            {"key": "tg_user_id", "value": str(user.id)},
+            {"key": "tg_username", "value": str(getattr(user, "username", "") or "")},
+            {"key": "girl_id", "value": str(g.get("id", ""))},
+            {"key": "girl_name", "value": gname},
+        ],
+    }
+
+    if price > 0:
+        if product_id > 0 and not WC_FORCE_FEE_ONLY:
+            payload["line_items"] = [{
+                "product_id": product_id,
+                "quantity": 1,
+                "subtotal": f"{price:.2f}",
+                "total": f"{price:.2f}",
+                "name": f"E-Girl booking: {gname}",
+            }]
+        else:
+            payload["fee_lines"] = [{
+                "name": f"E-Girl booking: {gname}",
+                "total": f"{price:.2f}",
+                "tax_status": "none",
+            }]
+
+    try:
+        auth = aiohttp.BasicAuth(WC_CONSUMER_KEY, WC_CONSUMER_SECRET)
+        async with aiohttp.ClientSession(auth=auth, connector=build_http_connector()) as s:
+            async with s.post(f"{WC_API_URL.rstrip('/')}/orders", json=payload, timeout=25) as r:
+                txt = await r.text()
+                if r.status >= 400:
+                    log.warning("Woo create order failed status=%s body=%s", r.status, txt[:1000])
+                    return None, None
+                data = json.loads(txt)
+    except Exception as e:
+        log.warning("Woo create order exception: %s", e)
+        return None, None
+
+    order_id = int(data.get("id")) if str(data.get("id", "")).isdigit() else None
+    payment_url = data.get("payment_url") or ""
+    if not payment_url and order_id and data.get("order_key"):
+        payment_url = (
+            f"{wc_store_base_url()}/checkout/order-pay/{order_id}/"
+            f"?pay_for_order=true&key={quote_plus(str(data.get('order_key')))}"
+        )
+    return order_id, (str(payment_url) if payment_url else None)
 
 def b64url_decode(s: str) -> bytes:
     s = s.replace('-', '+').replace('_', '/')
@@ -574,10 +1083,21 @@ def girl_by_index(mf: Dict[str, Any], idx: int) -> Optional[Dict[str, Any]]:
     return g
 
 async def http_get_json(url: str) -> Any:
-    async with aiohttp.ClientSession() as s:
+    connector = build_http_connector()
+    async with aiohttp.ClientSession(connector=connector) as s:
         async with s.get(url, timeout=20) as r:
             r.raise_for_status()
             return await r.json()
+
+def build_http_connector() -> aiohttp.TCPConnector:
+    ssl_no_verify = str(os.getenv("SSL_NO_VERIFY", "0")).strip().lower() in {"1", "true", "yes", "on"}
+    ssl_ctx: ssl.SSLContext | bool = True
+    if ssl_no_verify:
+        ssl_ctx = False
+    elif certifi is not None:
+        # Prefer certifi CA bundle on macOS/Python builds with broken system trust store.
+        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+    return aiohttp.TCPConnector(ssl=ssl_ctx)
 
 async def get_manifest(force=False) -> Dict[str, Any]:
     global _manifest_cache, _manifest_ts
@@ -627,28 +1147,444 @@ def profile_text(g: Dict[str, Any], slots: Dict[str, Any]) -> str:
              f"{html.escape(slot_text)}",
              f"💸 {price_line}"]
 
-    s_list = slots.get("slots") or []
+    social = build_social_proof(g)
+    if social:
+        lines.append("")
+        lines.extend(social)
+
+    s_list = collect_available_slots(g, slots)
     if s_list:
-        lines.append("\n<b>Ближайшие окна:</b>")
-        for s in s_list[:6]:
-            lines.append(f"• {html.escape(s.get('label',''))}")
+        lines.append("\n<b>Ближайшие 7 часов:</b>")
+        for s in s_list[:7]:
+            lines.append(f"• {html.escape(s)}")
 
     if desc:
         lines += ["", desc]
     return "\n".join(lines)
+
+def build_social_proof(g: Dict[str, Any]) -> List[str]:
+    acf = (g.get("acf") or {})
+
+    rating_raw = g.get("rating") or acf.get("rating")
+    bookings_raw = g.get("bookings_count") or acf.get("bookings_count") or g.get("orders_count")
+    review_raw = acf.get("review_short") or acf.get("review") or g.get("review")
+    best_for_raw = acf.get("best_for") or g.get("best_for")
+
+    cats = set(_cat_slugs(g))
+    if rating_raw is None:
+        if "bestseller" in cats:
+            rating = "в топе каталога"
+        elif "main" in cats:
+            rating = "рекомендуемая анкета"
+        else:
+            rating = "новые отзывы добавляются"
+    else:
+        rating = str(rating_raw)
+
+    if bookings_raw is None:
+        bookings = "по запросу"
+    else:
+        bookings = str(bookings_raw)
+
+    if not review_raw:
+        review = "Приятный вайб и комфортное общение."
+    else:
+        review = str(review_raw).strip()
+        if len(review) > 120:
+            review = review[:117].rsplit(" ", 1)[0] + "..."
+
+    if not best_for_raw:
+        games = acf.get("favorite_games") or []
+        if isinstance(games, list) and games:
+            best_for = "совместных игр и тёплого общения"
+        else:
+            best_for = "уютного общения и приятного вечера"
+    else:
+        best_for = str(best_for_raw).strip()
+
+    return [
+        f"⭐ Рейтинг: {html.escape(rating)}",
+        f"🏆 Бронирований: {html.escape(bookings)}",
+        f"💬 Отзыв: {html.escape(review)}",
+        f"🎯 Лучший выбор для: {html.escape(best_for)}",
+    ]
+
+def _parse_slot_dt(date_s: str | None, time_s: str | None) -> Optional[datetime]:
+    if not date_s or not time_s:
+        return None
+    try:
+        return datetime.strptime(f"{date_s} {time_s}", "%Y-%m-%d %H:%M")
+    except Exception:
+        return None
+
+def _msk_now_naive() -> datetime:
+    return datetime.utcnow() + timedelta(hours=3)
+
+def _today_slots_from_ops_calendar(g: Dict[str, Any]) -> List[Tuple[datetime, str]]:
+    now = _msk_now_naive()
+    today_s = now.strftime("%Y-%m-%d")
+    out: List[Tuple[datetime, str]] = []
+    seen: set[str] = set()
+    for day in (g.get("ops_calendar") or []):
+        if str(day.get("date")) != today_s:
+            continue
+        for s in (day.get("slots") or []):
+            if s.get("available", True) is False:
+                continue
+            start = str(s.get("start") or "").strip()
+            end = str(s.get("end") or "").strip()
+            if not start or not end or start == end:
+                continue
+            dt = _parse_slot_dt(today_s, start)
+            if not dt or dt < now:
+                continue
+            key = f"{today_s}|{start}|{end}"
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((dt, f"{start} - {end}"))
+    out.sort(key=lambda x: x[0])
+    return out
+
+def pick_free_today(mf: Dict[str, Any], limit: int = 5) -> List[Dict[str, Any]]:
+    arr = girls_list(mf) or []
+    ranked: List[Tuple[datetime, Dict[str, Any], str]] = []
+    for g in arr:
+        slots_today = _today_slots_from_ops_calendar(g)
+        if not slots_today:
+            continue
+        first_dt, first_label = slots_today[0]
+        ranked.append((first_dt, g, first_label))
+    ranked.sort(key=lambda x: x[0])
+    out: List[Dict[str, Any]] = []
+    for first_dt, g, first_label in ranked[:limit]:
+        item = g.copy()
+        item["_first_today_slot"] = first_label
+        item["_first_today_dt"] = first_dt
+        out.append(item)
+    return out
+
+def _has_future_slots(g: Dict[str, Any]) -> bool:
+    return len(collect_available_slots(g, {})) > 0
+
+def _filter_pick_girls(
+    mf: Dict[str, Any],
+    budget: str = "any",
+    style: str = "any",
+    date_pref: str = "any",
+    rating_pref: str = "any",
+    limit: int = 7
+) -> List[Dict[str, Any]]:
+    arr = girls_list(mf) or []
+    out: List[Tuple[float, Dict[str, Any]]] = []
+    now = _msk_now_naive()
+    today_s = now.strftime("%Y-%m-%d")
+
+    for g in arr:
+        p = _girl_price_num(g)
+        if budget == "low" and (p is None or p > 500):
+            continue
+        if budget == "mid" and (p is None or p < 500 or p > 1000):
+            continue
+        if budget == "high" and (p is None or p < 1000):
+            continue
+
+        cats = set(_cat_slugs(g))
+        if style == "popular" and not ({"bestseller", "main"} & cats):
+            continue
+        if style == "gamer":
+            games = (g.get("acf") or {}).get("favorite_games") or []
+            if not isinstance(games, list) or len(games) == 0:
+                continue
+        if style == "new":
+            ach = (g.get("acf") or {}).get("achievements") or []
+            if not isinstance(ach, list) or len(ach) == 0:
+                continue
+
+        today_slots = _today_slots_from_ops_calendar(g)
+        has_today = len(today_slots) > 0
+        has_any = _has_future_slots(g)
+        if date_pref == "today" and not has_today:
+            continue
+        if date_pref == "soon" and not has_any:
+            continue
+
+        score = 0.0
+        if rating_pref == "top":
+            if "bestseller" in cats:
+                score += 3.0
+            if "main" in cats:
+                score += 2.0
+        elif rating_pref == "safe":
+            if "main" in cats:
+                score += 2.0
+            if "bestseller" in cats:
+                score += 1.0
+
+        if has_today:
+            score += 1.5
+            score += max(0.0, 0.6 - min(0.6, (today_slots[0][0] - now).total_seconds() / 36000.0))
+        elif has_any:
+            score += 0.4
+
+        if p is not None:
+            score += max(0.0, 1.0 - min(1.0, p / 2500.0))
+
+        out.append((score, g))
+
+    out.sort(key=lambda x: x[0], reverse=True)
+    return [g for _, g in out[:limit]]
+
+def collect_available_slots(g: Dict[str, Any], slots: Dict[str, Any]) -> List[str]:
+    now = _msk_now_naive()
+    items: List[Tuple[datetime, str]] = []
+    seen: set[str] = set()
+
+    def _push(date_s: str | None, start: str | None, end: str | None, label: str | None, available: Any = True):
+        if available is False:
+            return
+        start = (start or "").strip()
+        end = (end or "").strip()
+        if not start or not end or start == end:
+            return
+        dt = _parse_slot_dt(date_s, start)
+        if not dt or dt < now:
+            return
+        label_core = (label or f"{start} - {end}").strip()
+        try:
+            day = datetime.strptime(date_s or "", "%Y-%m-%d").strftime("%d.%m")
+            pretty = f"{day} {label_core}"
+        except Exception:
+            pretty = label_core
+        key = f"{dt.isoformat()}::{pretty}"
+        if key in seen:
+            return
+        seen.add(key)
+        items.append((dt, pretty))
+
+    # New format from girls.json
+    for day in (g.get("ops_calendar") or []):
+        date_s = day.get("date")
+        for s in (day.get("slots") or []):
+            _push(
+                date_s=s.get("date") or date_s,
+                start=s.get("start"),
+                end=s.get("end"),
+                label=s.get("label"),
+                available=s.get("available", True)
+            )
+
+    # Backward-compatible format from slot_json
+    for s in (slots.get("slots") or []):
+        _push(
+            date_s=s.get("date"),
+            start=s.get("start"),
+            end=s.get("end"),
+            label=s.get("label"),
+            available=s.get("available", True)
+        )
+
+    items.sort(key=lambda x: x[0])
+    return [lbl for _, lbl in items]
+
+def collect_available_slot_keys(g: Dict[str, Any], slots: Dict[str, Any]) -> List[str]:
+    now = _msk_now_naive()
+    keys: List[Tuple[datetime, str]] = []
+    seen: set[str] = set()
+
+    def _push(date_s: str | None, start: str | None, end: str | None, available: Any = True):
+        if available is False:
+            return
+        start = (start or "").strip()
+        end = (end or "").strip()
+        if not start or not end or start == end:
+            return
+        dt = _parse_slot_dt(date_s, start)
+        if not dt or dt < now:
+            return
+        key = f"{date_s}|{start}|{end}"
+        if key in seen:
+            return
+        seen.add(key)
+        keys.append((dt, key))
+
+    for day in (g.get("ops_calendar") or []):
+        date_s = day.get("date")
+        for s in (day.get("slots") or []):
+            _push(
+                date_s=s.get("date") or date_s,
+                start=s.get("start"),
+                end=s.get("end"),
+                available=s.get("available", True)
+            )
+
+    for s in (slots.get("slots") or []):
+        _push(
+            date_s=s.get("date"),
+            start=s.get("start"),
+            end=s.get("end"),
+            available=s.get("available", True)
+        )
+
+    keys.sort(key=lambda x: x[0])
+    return [k for _, k in keys]
+
+def all_slots_text(g: Dict[str, Any], slots: Dict[str, Any]) -> str:
+    name = html.escape(str(g.get("name", "")))
+    s_list = collect_available_slots(g, slots)
+    if not s_list:
+        return f"<b>{name}</b>\n\nСвободного времени пока нет."
+    lines = [f"<b>{name}</b>", "", "<b>Все доступные окна:</b>"]
+    lines.extend([f"• {html.escape(s)}" for s in s_list])
+    return "\n".join(lines)
+
+def _girl_price_num(g: Dict[str, Any]) -> Optional[float]:
+    for k in ("from_price", "price"):
+        v = g.get(k)
+        if v is None:
+            continue
+        try:
+            return float(v)
+        except Exception:
+            pass
+    return None
+
+def _girl_style_tokens(g: Dict[str, Any]) -> set[str]:
+    tokens: set[str] = set()
+    for s in _cat_slugs(g):
+        tokens.add(f"cat:{s}")
+    for gimg in ((g.get("acf") or {}).get("favorite_games") or []):
+        if isinstance(gimg, str) and gimg:
+            tokens.add(f"game:{gimg.split('/')[-1].lower()}")
+    return tokens
+
+def _pick_recommendations(mf: Dict[str, Any], viewed_ids: List[int], limit: int = 3) -> List[Dict[str, Any]]:
+    arr = girls_list(mf) or []
+    if not arr:
+        return []
+
+    # Keep unique order by recency.
+    uniq_viewed: List[int] = []
+    seen_ids: set[int] = set()
+    for gid in viewed_ids:
+        if gid not in seen_ids:
+            uniq_viewed.append(gid)
+            seen_ids.add(gid)
+    if len(uniq_viewed) < 2:
+        return []
+
+    viewed_girls = [girl_by_id(mf, gid) for gid in uniq_viewed]
+    viewed_girls = [g for g in viewed_girls if g]
+    if len(viewed_girls) < 2:
+        return []
+
+    pref_tokens: Dict[str, int] = {}
+    prices: List[float] = []
+    for vg in viewed_girls:
+        for t in _girl_style_tokens(vg):
+            pref_tokens[t] = pref_tokens.get(t, 0) + 1
+        p = _girl_price_num(vg)
+        if p is not None:
+            prices.append(p)
+
+    target_price = (sum(prices) / len(prices)) if prices else None
+    viewed_set = set(uniq_viewed)
+
+    scored: List[Tuple[float, Dict[str, Any]]] = []
+    for cand in arr:
+        try:
+            cid = int(cand.get("id"))
+        except Exception:
+            continue
+        if cid in viewed_set:
+            continue
+
+        score = 0.0
+        cand_tokens = _girl_style_tokens(cand)
+        for t in cand_tokens:
+            score += pref_tokens.get(t, 0) * 1.5
+
+        if target_price is not None:
+            cp = _girl_price_num(cand)
+            if cp is not None:
+                diff = abs(cp - target_price)
+                if diff <= 100:
+                    score += 3.0
+                elif diff <= 300:
+                    score += 2.0
+                elif diff <= 600:
+                    score += 1.0
+
+        # Small boost for availability today.
+        if collect_available_slots(cand, {}):
+            score += 0.5
+
+        scored.append((score, cand))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    out: List[Dict[str, Any]] = []
+    for score, cand in scored:
+        if score <= 0:
+            continue
+        out.append(cand)
+        if len(out) >= limit:
+            break
+    return out
+
+async def maybe_send_personal_reco(chat_id: int):
+    viewed = await db_recent_interest_girl_ids(chat_id, limit=24, within_sec=7 * 24 * 3600)
+    # Trigger after browsing at least 2-3 profiles.
+    uniq_count = len(set(viewed))
+    if uniq_count < 2:
+        return
+    if await db_recent_reco_sent(chat_id, within_sec=6 * 3600):
+        return
+
+    mf = await get_manifest()
+    recs = _pick_recommendations(mf, viewed, limit=3)
+    if not recs:
+        return
+
+    rows = []
+    for g in recs:
+        name = str(g.get("name", f"#{g.get('id')}"))
+        url = g.get("bot_deeplink") or g.get("url") or SHOP_URL
+        rows.append([link_button(f"💜 {name}", url)])
+    rows.append([InlineKeyboardButton(text="👩 Смотреть всех", callback_data="girls:0")])
+
+    text = (
+        "💎 Похоже, тебе заходит похожий стиль.\n"
+        "Вот ещё 3 девушки, которые могут понравиться:"
+    )
+    with suppress(Exception):
+        await bot.send_message(chat_id, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        await db_mark_reco_sent(chat_id)
 
 # ─── BUTTON/KB HELPERS ───────────────────────────────────────────────────────
 def btn_url(text: str, url: str) -> Dict[str, str]:
     return {"text": text, "url": url}
 def btn_cb(text: str, cb: str) -> Dict[str, str]:
     return {"text": text, "cb": cb}
+
+def link_button(text: str, url: str) -> InlineKeyboardButton:
+    # Open regular HTTPS store links inside Telegram WebApp.
+    can_webapp = (
+        TG_OPEN_URLS_AS_WEBAPP
+        and isinstance(url, str)
+        and url.startswith("http")
+        and "t.me/" not in url
+    )
+    if can_webapp:
+        return InlineKeyboardButton(text=text, web_app=WebAppInfo(url=url))
+    return InlineKeyboardButton(text=text, url=url)
+
 def kb_from(rows: List[List[Dict[str, str]]]) -> InlineKeyboardMarkup:
     _rows = []
     for row in rows or []:
         btns = []
         for b in row:
             if "url" in b:
-                btns.append(InlineKeyboardButton(text=b["text"], url=b["url"]))
+                btns.append(link_button(b["text"], b["url"]))
             elif "cb" in b:
                 btns.append(InlineKeyboardButton(text=b["text"], callback_data=b["cb"]))
         if btns:
@@ -951,7 +1887,55 @@ CAMPAIGNS: Dict[str, List[Dict[str, Any]]] = {
             ],
         },
     ],
+    "timesall_followup": [
+        {
+            "delay": 0,
+            "kind": "text",
+            "text": (
+                "Ты ещё думаешь? 😏\n"
+                "Этот слот могут забрать в любой момент.\n\n"
+                "Лови <b>-10%</b> по купону <code>{coupon}</code>, если бронируешь в течение часа."
+            ),
+            "buttons": [
+                [btn_url("⚡ Забронировать сейчас", "{girl_url}")],
+                [btn_url("🎟 Применить -10%", "{apply_coupon}")]
+            ],
+        }
+    ],
 }
+
+async def schedule_timesall_followup(chat_id: int, girl_id: int, viewed_at: int):
+    # Random 15-30 min delay as requested.
+    await asyncio.sleep(random.randint(15 * 60, 30 * 60))
+
+    # If user had activity after opening full slots, skip follow-up.
+    last_seen = await db_user_last_seen(chat_id)
+    if last_seen is not None and last_seen > viewed_at + 5:
+        log.info("timesall_followup skipped: chat=%s girl=%s last_seen=%s viewed_at=%s", chat_id, girl_id, last_seen, viewed_at)
+        return
+
+    mf = await get_manifest()
+    g = girl_by_id(mf, girl_id)
+    if not g:
+        log.info("timesall_followup skipped: girl not found girl_id=%s", girl_id)
+        return
+
+    coupon = COUPON_CODE
+    ctx = {
+        "coupon": coupon,
+        "apply_coupon": apply_link(coupon),
+        "girl_name": g.get("name", ""),
+        "girl_url": g.get("url") or SHOP_URL,
+    }
+    payload_hash = f"timesall:{girl_id}:{viewed_at // 3600}"
+    await run_campaign(
+        chat_id=chat_id,
+        campaign="timesall_followup",
+        ctx=ctx,
+        reason="timesall_followup",
+        girl_id=girl_id,
+        payload_hash=payload_hash
+    )
 
 # ─── SEND STEPS / RUN CAMPAIGN ───────────────────────────────────────────────
 async def _send_step(chat_id: int, step: Dict[str, Any], ctx: Dict[str, Any], step_idx: int,
@@ -1032,22 +2016,47 @@ async def run_campaign(chat_id: int, campaign: str, ctx: Dict[str, Any], reason:
 
 # ─── KEYBOARDS (user) ────────────────────────────────────────────────────────
 def kb_home() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🛍 Перейти на сайт", url=SHOP_URL)],
-        [InlineKeyboardButton(text="👩 Посмотреть всех девочек", callback_data="girls:0")],
-        [InlineKeyboardButton(text="🆘 Поддержка", callback_data="support")]
-    ])
+    rows = [
+        [InlineKeyboardButton(text="🔥 Свободны сегодня", callback_data="free:today")],
+        [InlineKeyboardButton(text="👩‍🦰 Посмотреть всех девушек", callback_data="girls:0")],
+        [InlineKeyboardButton(text="🔎 Подобрать под себя", callback_data="find:start")],
+        [InlineKeyboardButton(text="──────────────", callback_data="noop")],
+        [InlineKeyboardButton(text="❤️ Моё избранное", callback_data="fav:list")],
+        [InlineKeyboardButton(text="🎁 -20% для новых", callback_data="new20")],
+        [InlineKeyboardButton(text="👑 VIP-клуб", callback_data="vip")],
+        [InlineKeyboardButton(text="──────────────", callback_data="noop")],
+        [InlineKeyboardButton(text="📲 Поддержка", callback_data="support")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def kb_profile(g: dict, slots: dict) -> InlineKeyboardMarkup:
+def kb_profile(g: dict, slots: dict, is_favorite: bool = False, is_slot_subscribed: bool = False) -> InlineKeyboardMarkup:
     idx = g.get("_index", 0)
     total = max(1, g.get("_total", 1))
     prev_idx = (idx - 1) % total
     next_idx = (idx + 1) % total
     booking_url = slots.get("scheduling_url") or g.get("url")
+    has_slots = len(collect_available_slots(g, slots)) > 0
 
-    rows = [
-        [InlineKeyboardButton(text="⚡ Забронировать E-Girl", url=booking_url)],
-        [InlineKeyboardButton(text="🕒 Предложить своё время", callback_data=f"suggest:{g['id']}")],
+    if wc_enabled():
+        booking_btn = InlineKeyboardButton(text="⚡ Забронировать E-Girl", callback_data=f"pay:start:{g['id']}")
+    else:
+        booking_btn = link_button("⚡ Забронировать E-Girl", booking_url)
+    rows = [[booking_btn]]
+    rows.append([
+        InlineKeyboardButton(
+            text=("💔 Убрать из избранного" if is_favorite else "❤️ Добавить в избранное"),
+            callback_data=(f"fav:del:{g['id']}" if is_favorite else f"fav:add:{g['id']}")
+        )
+    ])
+    if has_slots:
+        rows.append([
+            InlineKeyboardButton(
+                text=("🔕 Не уведомлять о слотах" if is_slot_subscribed else "🔔 Уведомлять о новых слотах"),
+                callback_data=(f"slotsub:del:{g['id']}" if is_slot_subscribed else f"slotsub:add:{g['id']}")
+            )
+        ])
+        rows.append([InlineKeyboardButton(text="🗓 Показать всё время", callback_data=f"timesall:{g['id']}")])
+    rows += [
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"girls:{prev_idx}"),
          InlineKeyboardButton(text="Вперёд ➡️", callback_data=f"girls:{next_idx}")],
         [InlineKeyboardButton(text="🏠 В меню", callback_data="home")]
@@ -1057,6 +2066,7 @@ def kb_profile(g: dict, slots: dict) -> InlineKeyboardMarkup:
 # ─── SIMPLE FSMs ─────────────────────────────────────────────────────────────
 PENDING_SUGGEST: Dict[int, int] = {}   # user_id -> girl_id
 PENDING_SUPPORT: Dict[int, bool] = {}  # user_id -> waiting for support message
+FIND_STATE: Dict[int, Dict[str, str]] = {}  # user_id -> filter wizard state
 
 # ─── ADMIN STATE (простая FSM в памяти) ──────────────────────────────────────
 ADMIN_STATE: Dict[int, Dict[str, Any]] = {}  # admin_id -> {mode, ...}
@@ -1561,6 +2571,7 @@ async def refresh(msg: Message):
 async def cancel(msg: Message):
     PENDING_SUPPORT.pop(msg.from_user.id, None)
     PENDING_SUGGEST.pop(msg.from_user.id, None)
+    FIND_STATE.pop(msg.from_user.id, None)
     ADMIN_STATE.pop(msg.from_user.id, None)
     BCAST_STATE.pop(msg.from_user.id, None)
     await msg.reply("Окей, отменил. Чем ещё помочь?")
@@ -1713,7 +2724,12 @@ async def start_with_payload(msg: Message, command: CommandObject):
                     f"Ссылка: {gurl}\n"
                     f"Источник: deeplink"
                 )
-                await bot.send_message(ADMIN_CHAT_ID, text_admin, disable_web_page_preview=True)
+                await bot.send_message(
+                    ADMIN_CHAT_ID,
+                    text_admin,
+                    disable_web_page_preview=True,
+                    disable_notification=True
+                )
                 log.info("ADMIN notify interest sent (source=deeplink, already=%s)", already)
             except Exception as e:
                 log.warning("admin interest notify failed: %s", e)
@@ -1722,6 +2738,8 @@ async def start_with_payload(msg: Message, command: CommandObject):
 
         with suppress(Exception):
             await db_add_interest(chat_id=msg.chat.id, girl_id=girl_id, source="deeplink")
+        with suppress(Exception):
+            asyncio.create_task(maybe_send_personal_reco(msg.chat.id))
 
         slots = {}
         try:
@@ -1731,7 +2749,9 @@ async def start_with_payload(msg: Message, command: CommandObject):
             log.warning("slots fetch failed: %s", e)
 
         caption = profile_text(g, slots)
-        kb      = kb_profile(g, slots)
+        is_fav  = await db_favorite_exists(msg.chat.id, girl_id)
+        is_sub  = await db_slot_sub_exists(msg.chat.id, girl_id)
+        kb      = kb_profile(g, slots, is_favorite=is_fav, is_slot_subscribed=is_sub)
         img     = g.get("image") or g.get("url")
 
         try:
@@ -1769,8 +2789,8 @@ async def start_with_payload(msg: Message, command: CommandObject):
     log.info("START coupon flow: reason=%r coupon=%r", reason, coupon)
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Применить −10% сейчас", url=apply_link(coupon))],
-        [InlineKeyboardButton(text="🛍 Перейти в магазин", url=SHOP_URL)],
+        [link_button("✅ Применить −10% сейчас", apply_link(coupon))],
+        [link_button("🛍 Перейти в магазин", SHOP_URL)],
         [InlineKeyboardButton(text="👩 Посмотреть всех девочек", callback_data="girls:0")],
     ])
     text = (
@@ -1909,16 +2929,244 @@ async def start_plain(msg: Message):
         reason=None,
         coupon=None
     )
-    await msg.answer("Приветик!", reply_markup=kb_home())
+    await msg.answer("Привет 😏\nКто сегодня свободен для тебя?", reply_markup=kb_home())
 
 # ─── HOME BTN ────────────────────────────────────────────────────────────────
 @rt.callback_query(F.data == "home")
 async def back_home(cb: CallbackQuery):
     await _touch_user(cb.from_user.id)
     await ack(cb)
-    await cb.message.answer("Приветик!", reply_markup=kb_home())
+    await cb.message.answer("Привет 😏\nКто сегодня свободен для тебя?", reply_markup=kb_home())
     with suppress(Exception):
         await cb.message.delete()
+
+@rt.callback_query(F.data.startswith("pay:start:"))
+async def start_checkout(cb: CallbackQuery):
+    await _touch_user(cb.from_user.id)
+    await ack(cb, "Создаю заказ…")
+
+    try:
+        gid = int(cb.data.split(":")[2])
+    except Exception:
+        await cb.message.answer("Не удалось создать заказ 😕")
+        return
+
+    mf = await get_manifest()
+    g = girl_by_id(mf, gid)
+    if not g:
+        await cb.message.answer("Не нашёл такую анкету 😭")
+        return
+
+    if not wc_enabled():
+        await cb.message.answer(
+            "Оплата через бот временно недоступна.\nИспользуй бронирование на сайте 👇",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [link_button("⚡ Открыть анкету", g.get("url") or SHOP_URL)]
+            ])
+        )
+        return
+
+    order_id, pay_url = await wc_create_order_for_girl(cb.from_user, g)
+    if not pay_url:
+        await cb.message.answer(
+            "Не получилось создать оплату автоматически 😕\n"
+            "Можно оформить прямо на сайте:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [link_button("⚡ Открыть анкету", g.get("url") or SHOP_URL)],
+                [InlineKeyboardButton(text="📲 Поддержка", callback_data="support")]
+            ])
+        )
+        return
+
+    txt = (
+        f"✅ Заказ создан{f' (#{order_id})' if order_id else ''}\n"
+        f"Девушка: <b>{html.escape(str(g.get('name', '')))}</b>\n"
+        "Нажми кнопку ниже, чтобы перейти к оплате."
+    )
+    await cb.message.answer(
+        txt,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [link_button("💳 Оплатить заказ", pay_url)],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="home")]
+        ])
+    )
+
+@rt.callback_query(F.data == "noop")
+async def noop_cb(cb: CallbackQuery):
+    await _touch_user(cb.from_user.id)
+    await ack(cb)
+
+@rt.callback_query(F.data == "new20")
+async def new20_offer(cb: CallbackQuery):
+    await _touch_user(cb.from_user.id)
+    await ack(cb)
+    coupon20 = await settings_get("COUPON_20", COUPON_20)
+    text = (
+        "🎁 <b>-20% для новых клиентов</b>\n\n"
+        f"Купон: <code>{html.escape(coupon20)}</code>\n"
+        "Действует ограниченное время."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [link_button("⚡ Применить -20%", apply_link(coupon20))],
+        [InlineKeyboardButton(text="👩 Смотреть девушек", callback_data="girls:0")]
+    ])
+    await cb.message.answer(text, reply_markup=kb)
+
+@rt.callback_query(F.data.startswith("find:"))
+async def find_girl_flow(cb: CallbackQuery):
+    await _touch_user(cb.from_user.id)
+    await ack(cb)
+
+    uid = cb.from_user.id
+    parts = cb.data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    def _kb_budget():
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💰 До 500 ₽", callback_data="find:budget:low")],
+            [InlineKeyboardButton(text="💰 500-1000 ₽", callback_data="find:budget:mid")],
+            [InlineKeyboardButton(text="💰 1000+ ₽", callback_data="find:budget:high")],
+            [InlineKeyboardButton(text="✨ Любой бюджет", callback_data="find:budget:any")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="home")],
+        ])
+
+    def _kb_style():
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔥 Популярные", callback_data="find:style:popular")],
+            [InlineKeyboardButton(text="🎮 Геймерские", callback_data="find:style:gamer")],
+            [InlineKeyboardButton(text="🆕 Новенькие", callback_data="find:style:new")],
+            [InlineKeyboardButton(text="✨ Любой типаж", callback_data="find:style:any")],
+        ])
+
+    def _kb_date():
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📅 Свободны сегодня", callback_data="find:date:today")],
+            [InlineKeyboardButton(text="⏳ Есть ближайшие окна", callback_data="find:date:soon")],
+            [InlineKeyboardButton(text="✨ Любая дата", callback_data="find:date:any")],
+        ])
+
+    def _kb_rating():
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⭐ Топ/бестселлеры", callback_data="find:rating:top")],
+            [InlineKeyboardButton(text="✅ Надёжный выбор", callback_data="find:rating:safe")],
+            [InlineKeyboardButton(text="✨ Без фильтра", callback_data="find:rating:any")],
+        ])
+
+    if action == "start":
+        FIND_STATE[uid] = {"budget": "any", "style": "any", "date": "any", "rating": "any"}
+        await cb.message.answer("🔎 <b>Подобрать девушку</b>\n\nШаг 1/4: выбери бюджет", reply_markup=_kb_budget())
+        return
+
+    st = FIND_STATE.get(uid)
+    if not st:
+        FIND_STATE[uid] = {"budget": "any", "style": "any", "date": "any", "rating": "any"}
+        st = FIND_STATE[uid]
+
+    if action == "budget" and len(parts) >= 3:
+        st["budget"] = parts[2]
+        FIND_STATE[uid] = st
+        await cb.message.answer("Шаг 2/4: выбери типаж", reply_markup=_kb_style())
+        return
+
+    if action == "style" and len(parts) >= 3:
+        st["style"] = parts[2]
+        FIND_STATE[uid] = st
+        await cb.message.answer("Шаг 3/4: выбери дату", reply_markup=_kb_date())
+        return
+
+    if action == "date" and len(parts) >= 3:
+        st["date"] = parts[2]
+        FIND_STATE[uid] = st
+        await cb.message.answer("Шаг 4/4: выбери уровень рейтинга", reply_markup=_kb_rating())
+        return
+
+    if action == "rating" and len(parts) >= 3:
+        st["rating"] = parts[2]
+        FIND_STATE[uid] = st
+        mf = await get_manifest()
+        picks = _filter_pick_girls(
+            mf,
+            budget=st.get("budget", "any"),
+            style=st.get("style", "any"),
+            date_pref=st.get("date", "any"),
+            rating_pref=st.get("rating", "any"),
+            limit=5
+        )
+        if not picks:
+            await cb.message.answer(
+                "Под этот набор фильтров пока ничего не нашлось 😕",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔁 Подобрать заново", callback_data="find:start")],
+                    [InlineKeyboardButton(text="👩 Смотреть всех", callback_data="girls:0")],
+                ])
+            )
+            return
+
+        lines = ["<b>🎯 Подобрал для тебя:</b>"]
+        rows = []
+        for i, g in enumerate(picks, start=1):
+            try:
+                gid = int(g.get("id"))
+            except Exception:
+                continue
+            full = girl_by_id(mf, gid)
+            if not full:
+                continue
+            idx = int(full.get("_index", 0))
+            name = html.escape(str(g.get("name", f"#{gid}")))
+            price = _girl_price_num(g)
+            price_text = f"{int(price)} ₽" if price is not None else "цена на сайте"
+            today_slots = _today_slots_from_ops_calendar(g)
+            future_slots = collect_available_slots(g, {})
+            slot_text = today_slots[0][1] if today_slots else (future_slots[0] if future_slots else "время уточняется")
+            lines.append(f"{i}. <b>{name}</b> — {html.escape(slot_text)} • {price_text}")
+            rows.append([InlineKeyboardButton(text=f"⚡ {g.get('name', f'#{gid}')}", callback_data=f"girls:{idx}")])
+
+        rows += [
+            [InlineKeyboardButton(text="🔁 Подобрать заново", callback_data="find:start")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="home")]
+        ]
+        await cb.message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        return
+
+@rt.callback_query(F.data == "free:today")
+async def free_today(cb: CallbackQuery):
+    await _touch_user(cb.from_user.id)
+    await ack(cb)
+
+    mf = await get_manifest()
+    picks = pick_free_today(mf, limit=5)
+    if not picks:
+        await cb.message.answer(
+            "На сегодня свободных окон пока нет 😕\n"
+            "Можешь посмотреть весь каталог и выбрать удобное время.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="👩 Открыть анкеты", callback_data="girls:0")],
+                [InlineKeyboardButton(text="🏠 В меню", callback_data="home")]
+            ])
+        )
+        return
+
+    lines = ["<b>🔥 Свободны сегодня</b>"]
+    rows = []
+    for i, g in enumerate(picks, start=1):
+        try:
+            gid = int(g.get("id"))
+        except Exception:
+            continue
+        full = girl_by_id(mf, gid)
+        if not full:
+            continue
+        idx = int(full.get("_index", 0))
+        name = html.escape(str(g.get("name", f"#{gid}")))
+        slot = html.escape(str(g.get("_first_today_slot", "—")))
+        price = _girl_price_num(g)
+        price_text = f"{int(price)} ₽" if price is not None else "цена на сайте"
+        lines.append(f"{i}. <b>{name}</b> — {slot} • {price_text}")
+        rows.append([InlineKeyboardButton(text=f"⚡ {g.get('name', f'#{gid}')}", callback_data=f"girls:{idx}")])
+
+    rows.append([InlineKeyboardButton(text="🏠 В меню", callback_data="home")])
+    await cb.message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 # ─── GIRLS FLOW ──────────────────────────────────────────────────────────────
 @rt.callback_query(F.data.startswith("girls:"))
@@ -1938,6 +3186,8 @@ async def show_girl(cb: CallbackQuery):
     # 1) Только логируем интерес (browse), БЕЗ админ-пинга
     with suppress(Exception):
         await db_add_interest(chat_id=cb.from_user.id, girl_id=gid, source="browse")
+    with suppress(Exception):
+        asyncio.create_task(maybe_send_personal_reco(cb.from_user.id))
 
     # 2) Рендер карточки
     slots = {}
@@ -1948,7 +3198,9 @@ async def show_girl(cb: CallbackQuery):
         log.warning("slots fetch failed: %s", e)
 
     caption = profile_text(g, slots)
-    kb      = kb_profile(g, slots)
+    is_fav  = await db_favorite_exists(cb.from_user.id, gid)
+    is_sub  = await db_slot_sub_exists(cb.from_user.id, gid)
+    kb      = kb_profile(g, slots, is_favorite=is_fav, is_slot_subscribed=is_sub)
     img     = g.get("image") or g.get("url")
 
     try:
@@ -1984,6 +3236,388 @@ async def show_girl(cb: CallbackQuery):
             )
     except Exception as e:
         log.warning("run_campaign(girl_interest) failed: %s", e)
+
+@rt.callback_query(F.data.startswith("timesall:"))
+async def show_all_times(cb: CallbackQuery):
+    await _touch_user(cb.from_user.id)
+    await ack(cb)
+    viewed_at = int(time.time())
+
+    try:
+        gid = int(cb.data.split(":")[1])
+    except Exception:
+        await cb.message.answer("Не удалось открыть время 😕")
+        return
+
+    mf = await get_manifest()
+    g = girl_by_id(mf, gid)
+    if not g:
+        await cb.message.answer("Не нашёл такую анкету 😭")
+        return
+
+    slots = {}
+    try:
+        if g.get("slot_json"):
+            slots = await get_slots(g["slot_json"])
+    except Exception as e:
+        log.warning("slots fetch failed: %s", e)
+
+    text = all_slots_text(g, slots)
+    if len(text) <= 4096:
+        await cb.message.answer(text)
+    else:
+        # Telegram limit for text message is 4096 chars; split by lines.
+        chunk = ""
+        for line in text.split("\n"):
+            part = (line + "\n")
+            if len(chunk) + len(part) > 3800:
+                await cb.message.answer(chunk.rstrip("\n"))
+                chunk = part
+            else:
+                chunk += part
+        if chunk:
+            await cb.message.answer(chunk.rstrip("\n"))
+
+    # Start "still thinking?" follow-up after 15-30 minutes if user went inactive.
+    asyncio.create_task(schedule_timesall_followup(cb.from_user.id, gid, viewed_at))
+
+@rt.callback_query(F.data.startswith("slotsub:"))
+async def slot_sub_cb(cb: CallbackQuery):
+    await _touch_user(cb.from_user.id)
+    await ack(cb)
+
+    parts = cb.data.split(":")
+    if len(parts) < 3:
+        await cb.message.answer("Не удалось обработать подписку 😕")
+        return
+    action = parts[1]
+    gid = int(parts[2])
+
+    mf = await get_manifest()
+    g = girl_by_id(mf, gid)
+    if not g:
+        await cb.message.answer("Не нашёл такую анкету 😭")
+        return
+
+    slots = {}
+    try:
+        if g.get("slot_json"):
+            slots = await get_slots(g["slot_json"])
+    except Exception as e:
+        log.warning("slots fetch failed: %s", e)
+
+    if action == "add":
+        known = collect_available_slot_keys(g, slots)
+        await db_slot_subscribe(cb.from_user.id, gid, known)
+        await cb.message.answer("Готово! Буду уведомлять о новых слотах 🔔")
+        return
+
+    if action == "del":
+        await db_slot_unsubscribe(cb.from_user.id, gid)
+        await cb.message.answer("Окей, отключил уведомления по этой анкете 🔕")
+        return
+
+@rt.callback_query(F.data == "vip")
+async def vip_info(cb: CallbackQuery):
+    await _touch_user(cb.from_user.id)
+    await ack(cb)
+    text = (
+        "🔥 <b>Как оформить красиво</b>\n\n"
+        "👑 <b>EGIRLZ PRIVATE CLUB</b>\n\n"
+        "Для постоянных клиентов.\n\n"
+        "Что даёт VIP:\n\n"
+        "• 🔥 -10% на каждое бронирование\n"
+        "• ⚡ Ранний доступ к новым слотам\n"
+        "• 🎁 1 бесплатная замена времени\n"
+        "• 📲 Приоритетная поддержка\n\n"
+        "VIP стоит 990 ₽ / месяц.\n"
+        "Окупается за 3–4 встречи.\n\n"
+        "Подключение занимает 30 секунд."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👑 Подключить VIP", callback_data="vip:buy")],
+        [InlineKeyboardButton(text="📲 Поддержка", callback_data="support")],
+        [InlineKeyboardButton(text="🏠 В меню", callback_data="home")]
+    ])
+    await cb.message.answer(text, reply_markup=kb)
+
+@rt.callback_query(F.data == "vip:buy")
+async def vip_buy(cb: CallbackQuery):
+    await _touch_user(cb.from_user.id)
+    await ack(cb, "Готовлю ссылку на оплату…")
+
+    if not platega_enabled():
+        await cb.message.answer(
+            "Оплата VIP временно недоступна 😕\n"
+            "Напиши в поддержку, подключим вручную.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📲 Поддержка", callback_data="support")]
+            ])
+        )
+        return
+
+    redirect_url, tx_id, status = await platega_create_vip_payment(cb.from_user)
+    await db_add_vip_payment(
+        chat_id=cb.from_user.id,
+        transaction_id=tx_id,
+        amount=VIP_PRICE,
+        currency=VIP_CURRENCY,
+        status=status,
+        redirect_url=redirect_url
+    )
+
+    if not redirect_url:
+        await cb.message.answer(
+            "Не удалось создать ссылку на оплату 😕\n"
+            "Попробуй ещё раз через минуту или напиши в поддержку.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📲 Поддержка", callback_data="support")]
+            ])
+        )
+        return
+
+    text = (
+        "✅ <b>VIP заявка создана</b>\n"
+        f"Сумма: <b>{int(VIP_PRICE)} {html.escape(VIP_CURRENCY)}</b>\n"
+        "Оплати по ссылке ниже (СБП QR)."
+    )
+    await cb.message.answer(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [link_button("💳 Оплатить VIP", redirect_url)],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="home")]
+        ])
+    )
+
+@rt.callback_query(F.data.startswith("sub:"))
+async def sub_reward_flow(cb: CallbackQuery):
+    await _touch_user(cb.from_user.id)
+    await ack(cb)
+
+    if not SUBSCRIBE_CHANNEL_URL or not SUBSCRIBE_CHANNEL_ID:
+        await cb.message.answer("Акция временно недоступна 😕")
+        return
+
+    if cb.data == "sub:start":
+        text = (
+            "🎁 Подпишись на наш канал и получи <b>20%</b> на первую встречу.\n\n"
+            "1) Подпишись на канал\n"
+            "2) Нажми «Я подписался»"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [link_button("📢 Открыть канал", SUBSCRIBE_CHANNEL_URL)],
+            [InlineKeyboardButton(text="✅ Я подписался", callback_data="sub:check")],
+            [InlineKeyboardButton(text="🏠 В меню", callback_data="home")]
+        ])
+        await cb.message.answer(text, reply_markup=kb)
+        return
+
+    if cb.data == "sub:check":
+        if await db_sub_reward_exists(cb.from_user.id):
+            coupon = SUBSCRIBE_COUPON
+            await cb.message.answer(
+                f"Ты уже получал купон 🎟\nТвой купон: <code>{html.escape(coupon)}</code>",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [link_button("⚡ Применить купон", apply_link(coupon))]
+                ])
+            )
+            return
+
+        ok = await is_user_subscribed(cb.from_user.id)
+        if not ok:
+            await cb.message.answer(
+                "Пока не вижу подписку 😕\nПодпишись и нажми кнопку ещё раз.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [link_button("📢 Открыть канал", SUBSCRIBE_CHANNEL_URL)],
+                    [InlineKeyboardButton(text="✅ Проверить снова", callback_data="sub:check")]
+                ])
+            )
+            return
+
+        coupon = SUBSCRIBE_COUPON
+        await db_mark_sub_reward(cb.from_user.id, coupon)
+        await cb.message.answer(
+            "Готово! Спасибо за подписку 💜\n"
+            f"Твой купон: <code>{html.escape(coupon)}</code>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [link_button("⚡ Применить купон", apply_link(coupon))]
+            ])
+        )
+        return
+
+async def slot_subscriptions_watcher():
+    while True:
+        try:
+            subs = await db_slot_subscriptions()
+            if subs:
+                mf = await get_manifest(force=True)
+                for sub in subs:
+                    chat_id = sub["chat_id"]
+                    gid = sub["girl_id"]
+                    g = girl_by_id(mf, gid)
+                    if not g:
+                        continue
+
+                    slots = {}
+                    try:
+                        if g.get("slot_json"):
+                            slots = await get_slots(g["slot_json"])
+                    except Exception as e:
+                        log.warning("slots fetch failed in watcher for girl_id=%s: %s", gid, e)
+                        continue
+
+                    current_keys = collect_available_slot_keys(g, slots)
+                    try:
+                        known_keys = json.loads(sub["known_slots"] or "[]")
+                        if not isinstance(known_keys, list):
+                            known_keys = []
+                    except Exception:
+                        known_keys = []
+
+                    known_set = {str(x) for x in known_keys}
+                    new_keys = [k for k in current_keys if k not in known_set]
+                    if not new_keys:
+                        # Keep known state fresh to prevent stale snapshots.
+                        await db_slot_sub_update_known(chat_id, gid, current_keys, touched_notify=False)
+                        continue
+
+                    name = html.escape(str(g.get("name", f"#{gid}")))
+                    pretty_lines: List[str] = []
+                    for k in new_keys[:3]:
+                        try:
+                            date_s, start, end = k.split("|", 2)
+                            day = datetime.strptime(date_s, "%Y-%m-%d").strftime("%d.%m")
+                            pretty_lines.append(f"• {day} {start} - {end}")
+                        except Exception:
+                            pass
+
+                    text = (
+                        f"🔥 У <b>{name}</b> появились новые слоты: <b>{len(new_keys)}</b>\n"
+                        + ("\n".join(pretty_lines) if pretty_lines else "")
+                    )
+                    deeplink = g.get("bot_deeplink") or g.get("url") or SHOP_URL
+                    kb = InlineKeyboardMarkup(inline_keyboard=[
+                        [link_button("⚡ Открыть анкету", deeplink)]
+                    ])
+                    with suppress(Exception):
+                        await bot.send_message(chat_id, text, reply_markup=kb)
+                    await db_slot_sub_update_known(chat_id, gid, current_keys, touched_notify=True)
+        except Exception as e:
+            log.warning("slot_subscriptions_watcher loop failed: %s", e)
+
+        await asyncio.sleep(60)
+
+async def slot_channel_news_watcher():
+    if not SLOT_NEWS_CHAT_ID:
+        return
+    while True:
+        try:
+            mf = await get_manifest(force=True)
+            for g in girls_list(mf):
+                try:
+                    gid = int(g.get("id"))
+                except Exception:
+                    continue
+                current_keys = collect_available_slot_keys(g, {})
+                known = await db_channel_state_get(gid)
+                # first sync: store baseline, don't spam channel on startup
+                if known is None:
+                    await db_channel_state_set(gid, current_keys, posted_now=False)
+                    continue
+
+                known_set = set(known)
+                new_keys = [k for k in current_keys if k not in known_set]
+                if not new_keys:
+                    # keep state fresh (drops expired slots too)
+                    await db_channel_state_set(gid, current_keys, posted_now=False)
+                    continue
+
+                name = html.escape(str(g.get("name", f"#{gid}")))
+                lines = [f"🔥 У <b>{name}</b> освободились новые слоты: <b>{len(new_keys)}</b>"]
+                for k in new_keys[:5]:
+                    lines.append(f"• {html.escape(slot_key_to_human(k))}")
+                deeplink = g.get("bot_deeplink") or g.get("url") or SHOP_URL
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⚡ Открыть анкету", url=deeplink)]
+                ])
+                with suppress(Exception):
+                    await bot.send_message(SLOT_NEWS_CHAT_ID, "\n".join(lines), reply_markup=kb)
+                await db_channel_state_set(gid, current_keys, posted_now=True)
+        except Exception as e:
+            log.warning("slot_channel_news_watcher loop failed: %s", e)
+
+        await asyncio.sleep(60)
+
+@rt.callback_query(F.data.startswith("fav:"))
+async def favorites_cb(cb: CallbackQuery):
+    await _touch_user(cb.from_user.id)
+    await ack(cb)
+
+    parts = cb.data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+
+    if action == "list":
+        fav_ids = await db_favorites_list(cb.from_user.id)
+        if not fav_ids:
+            await cb.message.answer("В избранном пока пусто 💔")
+            return
+
+        mf = await get_manifest()
+        rows = []
+        for gid in fav_ids[:20]:
+            g = girl_by_id(mf, gid)
+            if not g:
+                continue
+            rows.append([InlineKeyboardButton(text=f"❤️ {g.get('name', '#'+str(gid))}", callback_data=f"fav:open:{gid}")])
+        if not rows:
+            await cb.message.answer("В избранном пока пусто 💔")
+            return
+        rows.append([InlineKeyboardButton(text="🏠 В меню", callback_data="home")])
+        await cb.message.answer("❤️ <b>Моё избранное</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        return
+
+    if action in ("add", "del", "open") and len(parts) < 3:
+        await cb.message.answer("Не удалось обработать избранное 😕")
+        return
+
+    if action == "add":
+        gid = int(parts[2])
+        await db_favorite_add(cb.from_user.id, gid)
+        await cb.message.answer("Добавил в избранное ❤️")
+        return
+
+    if action == "del":
+        gid = int(parts[2])
+        await db_favorite_remove(cb.from_user.id, gid)
+        await cb.message.answer("Убрал из избранного")
+        return
+
+    if action == "open":
+        gid = int(parts[2])
+        mf = await get_manifest()
+        g = girl_by_id(mf, gid)
+        if not g:
+            await cb.message.answer("Не нашёл такую анкету 😭")
+            return
+
+        slots = {}
+        try:
+            if g.get("slot_json"):
+                slots = await get_slots(g["slot_json"])
+        except Exception as e:
+            log.warning("slots fetch failed: %s", e)
+
+        caption = profile_text(g, slots)
+        is_sub = await db_slot_sub_exists(cb.from_user.id, gid)
+        kb = kb_profile(g, slots, is_favorite=True, is_slot_subscribed=is_sub)
+        img = g.get("image") or g.get("url")
+
+        try:
+            await cb.message.answer_photo(photo=img, caption=caption, reply_markup=kb)
+        except Exception as e:
+            log.warning("favorites open answer_photo failed: %s", e)
+            await cb.message.answer(caption, reply_markup=kb)
+        return
 
 # ─── SUGGEST TIME ────────────────────────────────────────────────────────────
 @rt.callback_query(F.data.startswith("suggest:"))
@@ -2093,6 +3727,12 @@ async def inbox_private(msg: Message):
 async def main():
     db_init()
     await seed_campaigns_if_empty()
+    asyncio.create_task(slot_subscriptions_watcher())
+    if SLOT_NEWS_CHAT_ID:
+        asyncio.create_task(slot_channel_news_watcher())
+    # If webhook was set before, polling will fail with TelegramConflictError.
+    with suppress(Exception):
+        await bot.delete_webhook(drop_pending_updates=True)
     me = await bot.get_me()
     log.info("Bot online: @%s (%s)", me.username, me.id)
     await dp.start_polling(bot)
