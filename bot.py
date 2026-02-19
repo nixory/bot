@@ -4054,9 +4054,10 @@ async def pay_pick_slot(cb: CallbackQuery):
         )
     await checkout_state_clear(cb.from_user.id)
     addon_line = ", ".join(addon_labels) if addon_labels else "—"
+    order_line = f"Номер: <code>#{order_id}</code>\n" if order_id else ""
     await cb.message.answer(
         "✅ <b>Заказ создан</b>\n"
-        f"{f'Номер: <code>#{order_id}</code>\\n' if order_id else ''}"
+        f"{order_line}"
         f"Девушка: <b>{html.escape(str(s.get('girl_name') or g.get('name') or ''))}</b>\n"
         f"План: <b>{html.escape(str(plan.get('name') or ''))}</b>\n"
         f"Часы: <b>{hours}</b>\n"
