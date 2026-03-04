@@ -3307,6 +3307,60 @@ async def start_with_payload(msg: Message, command: CommandObject):
             await msg.answer("Не удалось подключиться к серверу. Попробуйте позже.")
         return
 
+    # ── worker linking deep link: /start worker_<worker_id> ──────────────
+    if payload.startswith("worker_"):
+        worker_id = payload.removeprefix("worker_")
+
+        if not worker_id.isdigit():
+            await msg.answer("Некорректная ссылка привязки. Открой анкету и попробуй снова.")
+            return
+
+        if not OPS_API_BASE:
+            log.error(
+                "worker deep-link skipped: OPS_API_BASE is empty; payload=%r user_id=%s",
+                payload,
+                msg.from_user.id,
+            )
+            await msg.answer("Привязка сейчас недоступна (не настроен API).")
+            return
+
+        headers = {"X-Bot-Secret": OPS_BOT_SECRET} if OPS_BOT_SECRET else {}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{OPS_API_BASE}/bot/link-worker",
+                    json={
+                        "worker_id":     int(worker_id),
+                        "tg_chat_id":    str(msg.chat.id),
+                        "tg_username":   msg.from_user.username or "",
+                    },
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        w_name = data.get("name", f"ID {worker_id}")
+                        log.info("worker link OK: worker_id=%s chat_id=%s", worker_id, msg.chat.id)
+                        await msg.answer(
+                            f"✅ Твой Telegram успешно привязан к профилю воркера (<b>{html.escape(w_name)}</b>)!\n\n"
+                            "Теперь ты будешь получать сюда уведомления о заказах и проверках анкеты.\n\n"
+                            "Можешь вернуться назад на сайт и продолжить заполнение.",
+                            parse_mode="HTML"
+                        )
+                    elif resp.status == 404:
+                        log.warning("worker link 404: worker_id=%s", worker_id)
+                        await msg.answer("Профиль воркера не найден. Попробуй обновить страницу анкеты.")
+                    elif resp.status == 401:
+                        await msg.answer("Ошибка авторизации. Обратись в поддержку.")
+                    else:
+                        body = await resp.text()
+                        log.warning("worker link error %s: %s", resp.status, body[:200])
+                        await msg.answer("Ошибка при привязке. Попробуй позже.")
+        except Exception as e:
+            log.warning("worker link request failed: %s", e)
+            await msg.answer("Не удалось подключиться к серверу. Попробуй позже.")
+        return
+
     # если пришёл girl_id — карточка и прогрев
     if girl_id is not None:
         mf = await get_manifest(force=True)
