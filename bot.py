@@ -3341,11 +3341,14 @@ async def start_with_payload(msg: Message, command: CommandObject):
                         data = await resp.json()
                         w_name = data.get("name", f"ID {worker_id}")
                         log.info("worker link OK: worker_id=%s chat_id=%s", worker_id, msg.chat.id)
+                        kb = InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="Вернуться к анкете 🔙", url="https://ops.egirlz.chat/worker")]
+                        ])
                         await msg.answer(
                             f"✅ Твой Telegram успешно привязан к профилю воркера (<b>{html.escape(w_name)}</b>)!\n\n"
-                            "Теперь ты будешь получать сюда уведомления о заказах и проверках анкеты.\n\n"
-                            "Можешь вернуться назад на сайт и продолжить заполнение.",
-                            parse_mode="HTML"
+                            "Теперь ты будешь получать сюда уведомления о заказах и проверках анкеты.",
+                            parse_mode="HTML",
+                            reply_markup=kb
                         )
                     elif resp.status == 404:
                         log.warning("worker link 404: worker_id=%s", worker_id)
